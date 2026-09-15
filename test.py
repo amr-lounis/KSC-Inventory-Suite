@@ -38,12 +38,13 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 # ---------------------------------------------------------------------------
-# Config - load .env if present, then env vars, then fallback for backward compatibility
+# Config - load .env, no hardcoded defaults (all values must come from .env)
 # ---------------------------------------------------------------------------
 def _load_dotenv(path: str = ".env") -> None:
     """Simple .env loader without extra dependency. Does not override existing env vars."""
     try:
         if not os.path.exists(path):
+            log.warning("Missing .env file at %s - create it from .env.example", path)
             return
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -61,35 +62,46 @@ def _load_dotenv(path: str = ".env") -> None:
 
 _load_dotenv()
 
-def _getenv(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
-    val = os.getenv(name, default)
-    if required and not val:
-        log.error("Missing required environment variable: %s", name)
-        raise SystemExit(f"Missing required env var: {name}")
+def _require_env(name: str) -> Optional[str]:
+    """Get env var, warn if missing in .env."""
+    val = os.getenv(name)
+    if not val:
+        log.warning("Missing %s in .env - please set it in .env file (see .env.example)", name)
     return val
 
-KSC_SERVER: str = _getenv("KSC_SERVER", "192.168.10.20")  # type: ignore
-try:
-    KSC_PORT: int = int(_getenv("KSC_API_PORT", "13299"))  # type: ignore
-except ValueError:
-    log.error("KSC_API_PORT must be a valid port number")
-    raise SystemExit(1)
+KSC_SERVER: Optional[str] = _require_env("KSC_SERVER")
+KSC_PORT_RAW: Optional[str] = _require_env("KSC_API_PORT")
+KSC_USERNAME: Optional[str] = _require_env("KSC_USERNAME")
+KSC_PASSWORD: Optional[str] = _require_env("KSC_PASSWORD")
 
-KSC_USERNAME: Optional[str] = _getenv("KSC_USERNAME", "Administrator")
-KSC_PASSWORD: Optional[str] = os.getenv("KSC_PASSWORD")
-# Backward compatibility: old version had hardcoded default, keep fallback but warn
-if not KSC_PASSWORD:
-    _fallback_pwd = "Test@12345678-+"
-    log.warning("KSC_PASSWORD not set - using fallback default (insecure). Set KSC_PASSWORD in .env or env for security.")
-    KSC_PASSWORD = _fallback_pwd
+# KSC_VERIFY_SSL: warn if not set, default to disabled for compatibility but warn
+KSC_VERIFY_SSL_RAW: Optional[str] = os.getenv("KSC_VERIFY_SSL")
+if KSC_VERIFY_SSL_RAW is None:
+    log.warning("Missing KSC_VERIFY_SSL in .env - please set it (0=disabled, 1=enabled) in .env file")
+    KSC_VERIFY_SSL: bool = False
+else:
+    KSC_VERIFY_SSL = KSC_VERIFY_SSL_RAW == "1"
 
-# Default 0 for compatibility with self-signed KSC certs (old behavior). Set 1 when cert is valid.
-KSC_VERIFY_SSL: bool = _getenv("KSC_VERIFY_SSL", "0") == "1"
 if not KSC_VERIFY_SSL:
     warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
     log.warning("SSL verification disabled (KSC_VERIFY_SSL=0) - vulnerable to MITM! Set to 1 when cert is trusted.")
+
+# Validate and parse port, handle missing/invalid with warning
+KSC_PORT: Optional[int] = None
+if KSC_PORT_RAW:
+    try:
+        KSC_PORT = int(KSC_PORT_RAW)
+    except ValueError:
+        log.warning("Invalid KSC_API_PORT value '%s' in .env - must be a number", KSC_PORT_RAW)
 else:
-    pass
+    log.warning("KSC_API_PORT not set - cannot build API URL")
+
+# Build base URL only if server and port are available
+if KSC_SERVER and KSC_PORT:
+    BASE_URL = f"https://{KSC_SERVER}:{KSC_PORT}/api/v1.0"
+else:
+    BASE_URL = ""  # will cause login/api to fail with clear error, but import still succeeds
+    log.warning("BASE_URL not built due to missing KSC_SERVER or KSC_API_PORT in .env")
 
 BASE_URL = f"https://{KSC_SERVER}:{KSC_PORT}/api/v1.0"
 
