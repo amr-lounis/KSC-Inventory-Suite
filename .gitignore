@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Virtual env
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Env / secrets - test.py contains KSC_PASSWORD
+.env
+.env.*
+*.pem
+*.key
+
+# Project output
+kaspersky_inventory_*.json
+*.log
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp
+*.tmp
+*.bak
