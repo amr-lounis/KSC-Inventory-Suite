@@ -590,15 +590,6 @@ def main():
     if not login(): return
     hs=hosts()
     if not hs: print("No hosts"); return
-    # فقط الخدمات التي تفتح منافذ (LISTENING)
-    osv=[s for s in os_svcs(only_with_ports=True) if s["state"].lower()=="running"]
-    if osv: 
-        print(f"[+] Found {len(osv)} running services WITH listening ports")
-        for s in osv:
-            ports=", ".join([f'{p["proto"]}:{p["port"]} ({p["local_addr"]})' for p in s.get("listening_ports",[])])
-            print(f"    - {s['name']} (PID {s.get('pid','?')}) [{s.get('exe','') or '?'} | {s.get('exe_path','') or s.get('pathname','') or s.get('exec_start','')}] -> {ports}")
-    else:
-        print("[*] No running services with listening ports found")
     out=[]
     for h in hs:
         info=h.get("pInfo",h) if isinstance(h,dict) else {}
@@ -611,9 +602,7 @@ def main():
         ips=ip2s(ip) if isinstance(ip,int) else (", ".join(ip2s(x) if isinstance(x,int) else str(x) for x in ip) if isinstance(ip,list) else str(ip or ""))
         print(f" -> {dsp} : inventory")
         pro,pat=inv(hid) if hid else ([],[])
-        is_local=ips=="127.0.0.1" or ips==S or dn.upper()=="WIN-SERVER-2022" or fqdn.lower().startswith("win-server-2022")
-        osv_host=osv if is_local else []
-        out.append({"host":{"display_name":dsp,"dn":dn,"fqdn":fqdn,"id":hid,"instance_id":str(info.get("KLHST_INSTANCEID") or ""),"ip":ips,"os":str(info.get("KLHST_WKS_OS_NAME") or ""),"nag_version":str(info.get("KLHST_WKS_NAG_VERSION") or ""),"last_visible":str(info.get("KLHST_WKS_LAST_VISIBLE") or "")},"software":pro,"os_services":osv_host,"patches":pat,"summary":{"total_products":len(pro),"total_os_services":len(osv_host),"total_patches":len(pat)}})
+        out.append({"host":{"display_name":dsp,"dn":dn,"fqdn":fqdn,"id":hid,"instance_id":str(info.get("KLHST_INSTANCEID") or ""),"ip":ips,"os":str(info.get("KLHST_WKS_OS_NAME") or ""),"nag_version":str(info.get("KLHST_WKS_NAG_VERSION") or ""),"last_visible":str(info.get("KLHST_WKS_LAST_VISIBLE") or "")},"software":pro,"os_services":[],"patches":pat,"summary":{"total_products":len(pro),"total_os_services":0,"total_patches":len(pat)}})
     data={"generated_at":datetime.now().isoformat(),"ksc_server":S,"total_hosts":len(out),"hosts":out}
     fn=f"kaspersky_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     open(fn,"w",encoding="utf-8").write(json.dumps(data,ensure_ascii=False,indent=2))
