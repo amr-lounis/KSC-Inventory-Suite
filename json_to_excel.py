@@ -66,9 +66,14 @@ def dedup_software(data):
     return OrderedDict(sorted_items)
 
 
-def write_excel(uniq_dict, output_path, source_json):
+def write_excel(uniq_dict, output_path, source_json, max_hosts_in_cell=10, max_cell_chars=300):
+    """
+    Write unique software to Excel.
+    For 1000 hosts: truncate Hosts cell to first N hosts + ' +N more', full list in Details sheet.
+    """
     if not HAS_OPENPYXL:
         raise RuntimeError("openpyxl not installed. Run: pip install openpyxl")
+    from openpyxl.comments import Comment
     wb = Workbook()
     ws = wb.active
     ws.title = "Unique Software"
@@ -78,10 +83,10 @@ def write_excel(uniq_dict, output_path, source_json):
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     thin = Side(style="thin", color="B4C6E7")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center")
-    left = Alignment(horizontal="left", vertical="center")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    headers = ["Software Name", "Version", "Publisher", "Hosts Count", "Hosts"]
+    headers = ["Software Name", "Version", "Publisher", "Hosts Count", "Hosts (sample)"]
     ws.append(headers)
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=col)
@@ -91,40 +96,112 @@ def write_excel(uniq_dict, output_path, source_json):
         c.border = border
 
     row = 2
+    # collect full mapping for Details sheet if needed
+    needs_details = any(len(v["hosts"]) > max_hosts_in_cell for v in uniq_dict.values())
     for (k, v) in uniq_dict.items():
+        hosts = v["hosts"]
+        # Truncate for main sheet
+        if len(hosts) > max_hosts_in_cell:
+            sample = ", ".join(hosts[:max_hosts_in_cell])
+            # also respect max_cell_chars
+            if len(sample) > max_cell_chars:
+                sample = sample[:max_cell_chars].rsplit(",", 1)[0]
+            display = f"{sample} +{len(hosts)-max_hosts_in_cell} more"
+            comment_text = ", ".join(hosts)  # full list in comment
+            if len(comment_text) > 2000:  # comment limit
+                comment_text = comment_text[:2000] + "..."
+        else:
+            joined = ", ".join(hosts)
+            if len(joined) > max_cell_chars:
+                joined = joined[:max_cell_chars].rsplit(",", 1)[0] + f" +{len(hosts)} truncated"
+                comment_text = ", ".join(hosts)
+            else:
+                joined = ", ".join(hosts)
+                comment_text = None
+            display = joined
         ws.cell(row=row, column=1, value=v["name"]).alignment = left
         ws.cell(row=row, column=2, value=v["version"]).alignment = center
         ws.cell(row=row, column=3, value=v["publisher"]).alignment = left
         ws.cell(row=row, column=4, value=v["count"]).alignment = center
-        ws.cell(row=row, column=5, value=", ".join(v["hosts"])).alignment = left
+        cell = ws.cell(row=row, column=5, value=display)
+        cell.alignment = left
+        if len(hosts) > max_hosts_in_cell and comment_text:
+            cell.comment = Comment(comment_text, "ksc_inventory", height=80, width=400)
         for col in range(1, 6):
             ws.cell(row=row, column=col).border = border
             ws.cell(row=row, column=col).font = Font(name="Calibri", size=10)
+        # slightly higher row for wrap
+        ws.row_dimensions[row].height = 15
         row += 1
 
     # Column widths
-    ws.column_dimensions["A"].width = 60
+    ws.column_dimensions["A"].width = 55
     ws.column_dimensions["B"].width = 18
     ws.column_dimensions["C"].width = 28
     ws.column_dimensions["D"].width = 12
-    ws.column_dimensions["E"].width = 30
+    ws.column_dimensions["E"].width = 45
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:E{row-1}"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-    # Info sheet
-    ws2 = wb.create_sheet("Info")
-    ws2["A1"] = "Source JSON"
-    ws2["B1"] = str(source_json)
-    ws2["A2"] = "Generated"
-    from datetime import datetime
-    ws2["B2"] = datetime.now().isoformat()
-    ws2["A3"] = "Total unique software (name+version)"
-    ws2["B3"] = len(uniq_dict)
-    for r in range(1, 4):
-        ws2[f"A{r}"].font = Font(bold=True)
-    ws2.column_dimensions["A"].width = 32
-    ws2.column_dimensions["B"].width = 60
+    # Details sheet: full host list per software (one row per software-host pair) for 1000-host case
+    if needs_details:
+        ws3 = wb.create_sheet("Details_FullHosts")
+        ws3.append(["Software Name", "Version", "Host"])
+        for col in range(1, 4):
+            c = ws3.cell(row=1, column=col)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = border
+        r = 2
+        for v in uniq_dict.values():
+            for h in v["hosts"]:
+                ws3.cell(row=r, column=1, value=v["name"])
+                ws3.cell(row=r, column=2, value=v["version"])
+                ws3.cell(row=r, column=3, value=h)
+                r += 1
+        ws3.column_dimensions["A"].width = 55
+        ws3.column_dimensions["B"].width = 18
+        ws3.column_dimensions["C"].width = 25
+        ws3.freeze_panes = "A2"
+        ws3.auto_filter.ref = f"A1:C{r-1}"
+
+    # New sheet as requested: columns = software (name + version), rows = hosts list
+    ws4 = wb.create_sheet("Hosts per Software")
+    # Header row: each column header is "Software Name [Version]"
+    col_idx = 1
+    max_hosts = max((len(v["hosts"]) for v in uniq_dict.values()), default=0)
+    for v in uniq_dict.values():
+        header = f"{v['name']}"
+        if v["version"]:
+            header += f" [{v['version']}]"
+        # Excel column header limit 255, truncate if needed
+        if len(header) > 250:
+            header = header[:250] + "..."
+        c = ws4.cell(row=1, column=col_idx, value=header)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = center
+        c.border = border
+        # fill hosts vertically
+        for r_idx, host in enumerate(v["hosts"], start=2):
+            cell = ws4.cell(row=r_idx, column=col_idx, value=host)
+            cell.font = Font(name="Calibri", size=10)
+            cell.alignment = left
+            cell.border = border
+        ws4.column_dimensions[ws4.cell(row=1, column=col_idx).column_letter].width = 22
+        col_idx += 1
+    ws4.freeze_panes = "A2"
+    # Auto filter over header row
+    if uniq_dict:
+        ws4.auto_filter.ref = f"A1:{ws4.cell(row=1, column=len(uniq_dict)).column_letter}1"
+        ws4.sheet_properties.pageSetUpPr.fitToPage = True
+        # set row height for header
+        ws4.row_dimensions[1].height = 30
+
+
 
     wb.save(output_path)
     return output_path
