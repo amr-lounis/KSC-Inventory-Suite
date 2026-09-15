@@ -24,6 +24,7 @@ env/
 *.key
 *.crt
 *.p12
+*.xlsx
 secrets.json
 
 # Project output - sensitive inventory
