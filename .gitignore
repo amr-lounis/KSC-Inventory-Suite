@@ -4,6 +4,10 @@ __pycache__/
 *$py.class
 *.pyc
 *.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Virtual env
 .Python
@@ -12,15 +16,22 @@ venv/
 ENV/
 env/
 
-# Env / secrets - test.py contains KSC_PASSWORD
+# Env / secrets
 .env
 .env.*
+!.env.example
 *.pem
 *.key
+*.crt
+*.p12
+secrets.json
 
-# Project output
+# Project output - sensitive inventory
 kaspersky_inventory_*.json
 *.log
+
+# Archive (created by __backup.bat)
+archive/
 
 # OS / editors
 .DS_Store
@@ -29,7 +40,10 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+*~
 
 # Temp
 *.tmp
 *.bak
+*.zip
+!requirements.txt
