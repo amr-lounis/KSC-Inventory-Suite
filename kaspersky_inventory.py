@@ -69,41 +69,34 @@ def _require_env(name: str) -> Optional[str]:
         log.warning("Missing %s in .env - please set it in .env file (see .env.example)", name)
     return val
 
-KSC_SERVER: Optional[str] = _require_env("KSC_SERVER")
-KSC_PORT_RAW: Optional[str] = _require_env("KSC_API_PORT")
+# Defaults as requested: KSC_SERVER=127.0.0.1, KSC_API_PORT=13299, KSC_VERIFY_SSL=0
+# These do not warn when missing, other settings still warn
+KSC_SERVER: str = os.getenv("KSC_SERVER") or "127.0.0.1"
+KSC_PORT_RAW: str = os.getenv("KSC_API_PORT") or "13299"
+KSC_VERIFY_SSL_RAW: str = os.getenv("KSC_VERIFY_SSL") or "0"
+KSC_VERIFY_SSL: bool = KSC_VERIFY_SSL_RAW == "1"
+
 KSC_USERNAME: Optional[str] = _require_env("KSC_USERNAME")
 KSC_PASSWORD: Optional[str] = _require_env("KSC_PASSWORD")
-
-# KSC_VERIFY_SSL: warn if not set, default to disabled for compatibility but warn
-KSC_VERIFY_SSL_RAW: Optional[str] = os.getenv("KSC_VERIFY_SSL")
-if KSC_VERIFY_SSL_RAW is None:
-    log.warning("Missing KSC_VERIFY_SSL in .env - please set it (0=disabled, 1=enabled) in .env file")
-    KSC_VERIFY_SSL: bool = False
-else:
-    KSC_VERIFY_SSL = KSC_VERIFY_SSL_RAW == "1"
 
 if not KSC_VERIFY_SSL:
     warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
     log.warning("SSL verification disabled (KSC_VERIFY_SSL=0) - vulnerable to MITM! Set to 1 when cert is trusted.")
 
-# Validate and parse port, handle missing/invalid with warning
+# Validate and parse port
 KSC_PORT: Optional[int] = None
-if KSC_PORT_RAW:
-    try:
-        KSC_PORT = int(KSC_PORT_RAW)
-    except ValueError:
-        log.warning("Invalid KSC_API_PORT value '%s' in .env - must be a number", KSC_PORT_RAW)
-else:
-    log.warning("KSC_API_PORT not set - cannot build API URL")
+try:
+    KSC_PORT = int(KSC_PORT_RAW)
+except ValueError:
+    log.warning("Invalid KSC_API_PORT value '%s' in .env - must be a number", KSC_PORT_RAW)
+    KSC_PORT = None
 
-# Build base URL only if server and port are available
+# Build base URL
 if KSC_SERVER and KSC_PORT:
     BASE_URL = f"https://{KSC_SERVER}:{KSC_PORT}/api/v1.0"
 else:
-    BASE_URL = ""  # will cause login/api to fail with clear error, but import still succeeds
-    log.warning("BASE_URL not built due to missing KSC_SERVER or KSC_API_PORT in .env")
-
-BASE_URL = f"https://{KSC_SERVER}:{KSC_PORT}/api/v1.0"
+    BASE_URL = ""
+    log.warning("BASE_URL not built due to invalid KSC_SERVER or KSC_API_PORT")
 
 session = requests.Session()
 session.verify = KSC_VERIFY_SSL
