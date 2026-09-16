@@ -1,0 +1,7 @@
+{
+  "KSC_SERVER": "192.168.10.20",
+  "KSC_API_PORT": 13299,
+  "KSC_VERIFY_SSL": false,
+  "KSC_USERNAME": "Administrator",
+  "KSC_PASSWORD": "ChangeMe123!"
+}

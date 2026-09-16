@@ -1,2 +1,11 @@
+# Kaspersky Inventory - Python dependencies
+# Tested with Python 3.11.9
+# Install: pip install -r requirements.txt
+
+# Core - KSC API
 requests>=2.31.0
 urllib3>=2.0.0
+
+# Excel export (json_to_excel.py)
+openpyxl>=3.1.5
+et-xmlfile>=1.1.0

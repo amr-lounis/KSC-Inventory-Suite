@@ -16,10 +16,10 @@ venv/
 ENV/
 env/
 
-# Env / secrets
-.env
-.env.*
-!.env.example
+# Secrets
+settings.json
+settings.*.json
+!settings.example.json
 *.pem
 *.key
 *.crt

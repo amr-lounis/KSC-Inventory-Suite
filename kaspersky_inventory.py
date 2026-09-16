@@ -1,37 +1,230 @@
 #!/usr/bin/env python3
-import os, json, base64, struct, socket, logging, argparse, warnings
+import os, json, base64, struct, socket, logging, argparse, warnings, getpass, sys
+from pathlib import Path
 from datetime import datetime, timezone
 import requests, urllib3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ksc")
 
-# load .env
-def load_dotenv(p=".env"):
-    if not os.path.exists(p):
-        return
-    for line in open(p, encoding="utf-8"):
-        line=line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k,v=line.split("=",1)
-        k=k.strip(); v=v.strip().strip('"').strip("'")
-        if k and k not in os.environ:
-            os.environ[k]=v
-load_dotenv()
+# ---------- settings.json handling ----------
+SETTINGS_PATH = Path(__file__).parent / "settings.json"
+DEFAULT_SETTINGS = {
+    "KSC_SERVER": "127.0.0.1",
+    "KSC_API_PORT": 13299,
+    "KSC_VERIFY_SSL": False,
+    "KSC_USERNAME": "",
+    "KSC_PASSWORD": ""
+}
 
-KSC_SERVER = os.getenv("KSC_SERVER") or "127.0.0.1"
-KSC_PORT = int(os.getenv("KSC_API_PORT") or "13299")
-KSC_VERIFY_SSL = (os.getenv("KSC_VERIFY_SSL") or "0") == "1"
-KSC_USERNAME = os.getenv("KSC_USERNAME")
-KSC_PASSWORD = os.getenv("KSC_PASSWORD")
-if not KSC_USERNAME or not KSC_PASSWORD:
-    log.warning("Missing KSC_USERNAME/KSC_PASSWORD in .env")
+def load_settings(path=SETTINGS_PATH):
+    if not Path(path).exists():
+        return {}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        log.warning("Failed to load %s: %s", path, e)
+    return {}
 
-if not KSC_VERIFY_SSL:
-    warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
-    log.warning("SSL verification disabled (KSC_VERIFY_SSL=0)")
+def save_settings(settings, path=SETTINGS_PATH):
+    try:
+        Path(path).write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.info("Settings saved to %s", path)
+    except Exception as e:
+        log.error("Failed to save settings %s: %s", path, e)
 
+def _prompt_text(label, default=""):
+    d = str(default) if default is not None else ""
+    suffix = f" [{d}]" if d else ""
+    try:
+        val = input(f"{label}{suffix}: ").strip()
+    except EOFError:
+        val = ""
+    if val == "":
+        return d
+    return val
+
+def _prompt_int(label, default):
+    while True:
+        raw = _prompt_text(label, str(default))
+        try:
+            iv = int(raw)
+            if 1 <= iv <= 65535:
+                return iv
+            print("  -> Port must be 1-65535")
+        except ValueError:
+            print("  -> Invalid number, try again")
+
+def _prompt_bool(label, default):
+    # default bool
+    def_str = "Y/n" if default else "y/N"
+    while True:
+        raw = _prompt_text(f"{label} ({def_str})", "")
+        if raw == "":
+            return default
+        low = raw.strip().lower()
+        if low in ("y", "yes", "1", "true"):
+            return True
+        if low in ("n", "no", "0", "false"):
+            return False
+        print("  -> Enter y or n")
+
+def _prompt_password(label, default=""):
+    has_default = bool(default)
+    hint = "******" if has_default else ""
+    suffix = f" [{hint}]" if has_default else ""
+    prompt = f"{label}{suffix}: "
+    try:
+        # getpass hides input; if no tty fallback to input
+        if sys.stdin.isatty():
+            val = getpass.getpass(prompt)
+        else:
+            val = input(prompt).strip()
+    except EOFError:
+        val = ""
+    except Exception:
+        val = input(prompt).strip()
+    if val == "" and has_default:
+        return default
+    return val
+
+def prompt_for_config(existing):
+    """Interactive prompt, pre-filled from existing (settings.json). Returns new dict."""
+    print("\n=== Kaspersky Security Center - Configuration ===")
+    if Path(SETTINGS_PATH).exists():
+        print(f"Found {SETTINGS_PATH} - press Enter to keep current value, or type new value.\n")
+    else:
+        print(f"No {SETTINGS_PATH} found - you will be asked for each value. It will be created.\n")
+
+    # merge defaults + existing to show pre-filled
+    cur = {**DEFAULT_SETTINGS, **(existing or {})}
+    # normalize types from json (port may be str, verify may be 0/1)
+    try:
+        cur["KSC_API_PORT"] = int(cur.get("KSC_API_PORT", 13299))
+    except:
+        cur["KSC_API_PORT"] = 13299
+    v = cur.get("KSC_VERIFY_SSL", False)
+    if isinstance(v, str):
+        cur["KSC_VERIFY_SSL"] = v == "1" or v.lower() in ("true", "yes", "y")
+    elif isinstance(v, int):
+        cur["KSC_VERIFY_SSL"] = bool(v)
+    else:
+        cur["KSC_VERIFY_SSL"] = bool(v)
+
+    new = {}
+    new["KSC_SERVER"] = _prompt_text("KSC_SERVER (IP/hostname)", cur.get("KSC_SERVER", "127.0.0.1"))
+    new["KSC_API_PORT"] = _prompt_int("KSC_API_PORT", cur.get("KSC_API_PORT", 13299))
+    new["KSC_VERIFY_SSL"] = _prompt_bool("Verify SSL", cur.get("KSC_VERIFY_SSL", False))
+    new["KSC_USERNAME"] = _prompt_text("KSC_USERNAME", cur.get("KSC_USERNAME", ""))
+    # validate username not empty
+    while not new["KSC_USERNAME"].strip():
+        print("  -> Username cannot be empty")
+        new["KSC_USERNAME"] = _prompt_text("KSC_USERNAME", "")
+
+    new["KSC_PASSWORD"] = _prompt_password("KSC_PASSWORD", cur.get("KSC_PASSWORD", ""))
+    while not new["KSC_PASSWORD"]:
+        print("  -> Password cannot be empty")
+        new["KSC_PASSWORD"] = _prompt_password("KSC_PASSWORD", "")
+
+    # save logic: only ask if settings.json does not exist, otherwise auto-save
+    existed_before = Path(SETTINGS_PATH).exists()
+    if existed_before:
+        save_settings(new, SETTINGS_PATH)
+    else:
+        save_q = _prompt_text(f"Save to {SETTINGS_PATH}? (Y/n)", "Y")
+        do_save = save_q.strip().lower() not in ("n", "no")
+        if do_save:
+            save_settings(new, SETTINGS_PATH)
+        else:
+            print("  -> Not saved (using in-memory only)")
+
+    return new
+
+def init_config(args):
+    """
+    Load settings.json, optionally prompt interactively.
+    Returns config dict and applies globals BASE_URL / session.verify.
+    """
+    global KSC_SERVER, KSC_PORT, KSC_VERIFY_SSL, KSC_USERNAME, KSC_PASSWORD, BASE_URL, SETTINGS_PATH
+
+    # allow custom path via --settings
+    settings_path = Path(getattr(args, "settings", None) or SETTINGS_PATH)
+    existing = load_settings(settings_path)
+
+    # --no-input : never prompt, just use settings.json / defaults
+    no_input = bool(getattr(args, "no_input", False))
+
+    # also respect --ksc-server etc if passed via CLI (optional, for automation)
+    cli_overrides = {}
+    for k in ("KSC_SERVER", "KSC_API_PORT", "KSC_VERIFY_SSL", "KSC_USERNAME", "KSC_PASSWORD"):
+        # argparse may have lowercased names
+        attr = k.lower()
+        if hasattr(args, attr) and getattr(args, attr) is not None:
+            cli_overrides[k] = getattr(args, attr)
+
+    if cli_overrides:
+        # CLI takes precedence, no prompt needed
+        cfg = {**DEFAULT_SETTINGS, **existing, **cli_overrides}
+        # normalize
+        cfg["KSC_API_PORT"] = int(cfg["KSC_API_PORT"])
+        cfg["KSC_VERIFY_SSL"] = bool(cfg["KSC_VERIFY_SSL"]) if not isinstance(cfg["KSC_VERIFY_SSL"], str) else cfg["KSC_VERIFY_SSL"] in ("1", "true", "True", "yes")
+    elif no_input:
+        cfg = {**DEFAULT_SETTINGS, **existing}
+        try:
+            cfg["KSC_API_PORT"] = int(cfg["KSC_API_PORT"])
+        except:
+            cfg["KSC_API_PORT"] = 13299
+        v = cfg.get("KSC_VERIFY_SSL", False)
+        if isinstance(v, str):
+            cfg["KSC_VERIFY_SSL"] = v == "1" or v.lower() in ("true", "yes")
+        elif isinstance(v, int):
+            cfg["KSC_VERIFY_SSL"] = bool(v)
+        SETTINGS_PATH = settings_path
+        if not cfg.get("KSC_USERNAME") or not cfg.get("KSC_PASSWORD"):
+            log.error("Settings %s missing username/password. Run without --no-input to create it.", settings_path)
+    else:
+        # interactive: always prompt (pre-filled from settings.json if exists)
+        # if stdin is not a tty but input is piped, _prompt_* will handle EOF gracefully
+        if not sys.stdin.isatty() and (not existing or not existing.get("KSC_USERNAME")):
+            log.warning("stdin is not a tty - trying to prompt anyway (piped input?)")
+        SETTINGS_PATH = settings_path
+        try:
+            cfg = prompt_for_config(existing)
+        except (EOFError, KeyboardInterrupt):
+            log.warning("Prompt interrupted / no input - falling back to %s", settings_path)
+            cfg = {**DEFAULT_SETTINGS, **existing}
+            try:
+                cfg["KSC_API_PORT"] = int(cfg["KSC_API_PORT"])
+            except:
+                cfg["KSC_API_PORT"] = 13299
+
+    # apply globals
+    KSC_SERVER = str(cfg.get("KSC_SERVER") or DEFAULT_SETTINGS["KSC_SERVER"]).strip()
+    KSC_PORT = int(cfg.get("KSC_API_PORT") or 13299)
+    KSC_VERIFY_SSL = bool(cfg.get("KSC_VERIFY_SSL"))
+    KSC_USERNAME = str(cfg.get("KSC_USERNAME") or "").strip()
+    KSC_PASSWORD = str(cfg.get("KSC_PASSWORD") or "")
+
+    BASE_URL = f"https://{KSC_SERVER}:{KSC_PORT}/api/v1.0"
+    session.verify = KSC_VERIFY_SSL
+    session.headers["Content-Type"] = "application/json"
+
+    if not KSC_VERIFY_SSL:
+        warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
+        log.warning("SSL verification disabled (KSC_VERIFY_SSL=0)")
+    else:
+        warnings.filterwarnings("default", category=urllib3.exceptions.InsecureRequestWarning)
+
+    return cfg
+
+# will be set by init_config()
+KSC_SERVER = DEFAULT_SETTINGS["KSC_SERVER"]
+KSC_PORT = DEFAULT_SETTINGS["KSC_API_PORT"]
+KSC_VERIFY_SSL = DEFAULT_SETTINGS["KSC_VERIFY_SSL"]
+KSC_USERNAME = DEFAULT_SETTINGS["KSC_USERNAME"]
+KSC_PASSWORD = DEFAULT_SETTINGS["KSC_PASSWORD"]
 BASE_URL = f"https://{KSC_SERVER}:{KSC_PORT}/api/v1.0"
 session = requests.Session()
 session.verify = KSC_VERIFY_SSL
@@ -147,8 +340,30 @@ def main(argv=None):
     p.add_argument("-o","--output",help="output JSON path")
     p.add_argument("--no-patches",action="store_true",help="skip patches")
     p.add_argument("-v","--verbose",action="store_true")
+    p.add_argument("--settings",help="path to settings.json (default: ./settings.json)", default=str(SETTINGS_PATH))
+    p.add_argument("--no-input",action="store_true",help="do not prompt, use settings.json directly (for automation)")
+    # optional CLI overrides for automation (if provided, no prompt)
+    p.add_argument("--ksc-server", dest="ksc_server", help=argparse.SUPPRESS)
+    p.add_argument("--ksc-api-port", dest="ksc_api_port", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--ksc-username", dest="ksc_username", help=argparse.SUPPRESS)
+    p.add_argument("--ksc-password", dest="ksc_password", help=argparse.SUPPRESS)
     a=p.parse_args(argv)
     if a.verbose: logging.getLogger().setLevel(logging.DEBUG)
+
+    # map CLI overrides to expected keys for init_config
+    # init_config reads a.ksc_* directly
+    # normalize: create KSC_* attrs on a for init_config
+    if getattr(a, "ksc_server", None) is not None:
+        a.KSC_SERVER = a.ksc_server
+    if getattr(a, "ksc_api_port", None) is not None:
+        a.KSC_API_PORT = a.ksc_api_port
+    if getattr(a, "ksc_username", None) is not None:
+        a.KSC_USERNAME = a.ksc_username
+    if getattr(a, "ksc_password", None) is not None:
+        a.KSC_PASSWORD = a.ksc_password
+
+    init_config(a)
+
     if not login(): return 1
     hosts=get_hosts()
     if not hosts:
