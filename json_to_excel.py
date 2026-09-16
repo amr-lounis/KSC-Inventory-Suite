@@ -4,7 +4,6 @@ from pathlib import Path
 from collections import OrderedDict
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.comments import Comment
 
 def get_app_dir():
     if getattr(sys, 'frozen', False):
@@ -37,7 +36,7 @@ def dedup(data):
                     uniq[key]["hosts"].append(hn)
     return OrderedDict(sorted(uniq.items(), key=lambda kv:(kv[0][0],kv[0][1])))
 
-def write_excel(uniq, out, max_hosts=10):
+def write_excel(uniq, out):
     wb=Workbook()
     ws=wb.active; ws.title="Unique Software"
     hdr_font=Font(bold=True,color="FFFFFF")
@@ -45,47 +44,24 @@ def write_excel(uniq, out, max_hosts=10):
     thin=Side(style="thin",color="B4C6E7"); bd=Border(left=thin,right=thin,top=thin,bottom=thin)
     center=Alignment(horizontal="center",vertical="center",wrap_text=True)
     left=Alignment(horizontal="left",vertical="center",wrap_text=True)
-    headers=["Software Name","Version","Publisher","Hosts Count","Hosts (sample)"]
+    headers=["Software Name","Version","Publisher","Hosts Count"]
     ws.append(headers)
-    for c in range(1,6):
+    for c in range(1,5):
         x=ws.cell(row=1,column=c); x.font=hdr_font; x.fill=hdr_fill; x.alignment=center; x.border=bd
     r=2
-    need_details=any(len(v["hosts"])>max_hosts for v in uniq.values())
     for v in uniq.values():
-        hosts=v["hosts"]
-        if len(hosts)>max_hosts:
-            disp=", ".join(hosts[:max_hosts])+f" +{len(hosts)-max_hosts} more"
-            comm=", ".join(hosts)[:2000]
-        else:
-            disp=", ".join(hosts)
-            comm=None
         ws.cell(row=r,column=1,value=v["name"]).alignment=left
         ws.cell(row=r,column=2,value=v["version"]).alignment=center
         ws.cell(row=r,column=3,value=v["publisher"]).alignment=left
         ws.cell(row=r,column=4,value=v["count"]).alignment=center
-        c=ws.cell(row=r,column=5,value=disp); c.alignment=left
-        if comm and len(hosts)>max_hosts:
-            c.comment=Comment(comm,"ksc",width=400,height=80)
-        for col in range(1,6):
+        for col in range(1,5):
             ws.cell(row=r,column=col).border=bd
         r+=1
     ws.column_dimensions["A"].width=55; ws.column_dimensions["B"].width=18
     ws.column_dimensions["C"].width=28; ws.column_dimensions["D"].width=12
-    ws.column_dimensions["E"].width=45
-    ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:E{r-1}"
-    if need_details:
-        ws2=wb.create_sheet("Details_FullHosts")
-        ws2.append(["Software Name","Version","Host"])
-        for c in range(1,4):
-            x=ws2.cell(row=1,column=c); x.font=hdr_font; x.fill=hdr_fill; x.alignment=center; x.border=bd
-        rr=2
-        for v in uniq.values():
-            for h in v["hosts"]:
-                ws2.cell(row=rr,column=1,value=v["name"]); ws2.cell(row=rr,column=2,value=v["version"]); ws2.cell(row=rr,column=3,value=h)
-                rr+=1
-        ws2.column_dimensions["A"].width=55; ws2.column_dimensions["B"].width=18; ws2.column_dimensions["C"].width=25
-        ws2.freeze_panes="A2"; ws2.auto_filter.ref=f"A1:C{rr-1}"
-    # Hosts per Software: columns=software, rows=hosts
+    ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:D{r-1}"
+
+    # Sheet 2: Hosts per Software (columns=software)
     ws3=wb.create_sheet("Hosts per Software")
     col=1
     for v in uniq.values():

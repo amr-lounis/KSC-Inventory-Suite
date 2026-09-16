@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-set ARCHIVE_DIR=..\archive
+set ARCHIVE_DIR=..\archive_kaspersky
 mkdir "%ARCHIVE_DIR%" 2>nul
 
 :: Find last version
