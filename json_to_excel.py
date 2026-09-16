@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, glob, os
+import json, glob, os
 from pathlib import Path
 from collections import OrderedDict
 from openpyxl import Workbook
@@ -95,45 +95,23 @@ def write_excel(uniq, out, max_hosts=10):
         ws3.freeze_panes="A2"; ws3.auto_filter.ref=f"A1:{ws3.cell(row=1,column=len(uniq)).column_letter}1"
     wb.save(out)
 
-def process_one(inp, args, override=None):
+def process_one(inp):
     print(f"\nInput: {inp}")
     data=load_json(inp)
     total=sum(len(h.get("software",[])) for h in data.get("hosts",[]))
     uniq=dedup(data)
     print(f"Hosts {len(data.get('hosts',[]))} total {total} unique {len(uniq)}")
-    if args.all_hosts:
-        wb=Workbook(); ws=wb.active; ws.title="Per Host"
-        hdr_font=Font(bold=True,color="FFFFFF"); hdr_fill=PatternFill(start_color="4472C4",end_color="4472C4",fill_type="solid")
-        thin=Side(style="thin",color="B4C6E7"); bd=Border(left=thin,right=thin,top=thin,bottom=thin)
-        ws.append(["Host","Software Name","Version","Publisher"])
-        for c in range(1,5):
-            x=ws.cell(row=1,column=c); x.font=hdr_font; x.fill=hdr_fill; x.border=bd
-        r=2
-        for h in data.get("hosts",[]):
-            hn=h.get("host",{}).get("display_name","unknown")
-            for sw in h.get("software",[]):
-                ws.cell(row=r,column=1,value=hn); ws.cell(row=r,column=2,value=sw.get("name","")); ws.cell(row=r,column=3,value=sw.get("version","")); ws.cell(row=r,column=4,value=sw.get("publisher",""))
-                r+=1
-        out=override or args.output or f"software_per_host_{Path(inp).stem}.xlsx"
-        wb.save(out); print(f"Saved {out}"); return 0
-    out=override or args.output or f"software_inventory_{Path(inp).stem}.xlsx"
+    out=f"software_inventory_{Path(inp).stem}.xlsx"
     write_excel(uniq,out); print(f"Saved {out}"); return 0
 
 def main():
-    p=argparse.ArgumentParser(description="Convert Kaspersky JSON to Excel (dedup name+version)")
-    p.add_argument("-i","--input",help="input JSON (default all)")
-    p.add_argument("-o","--output",help="output xlsx (single file only)")
-    p.add_argument("--all-hosts",action="store_true",help="per host list, no dedup")
-    a=p.parse_args()
-    if a.input:
-        return process_one(a.input,a)
     files=find_all()
     if not files:
         print("No kaspersky_inventory_*.json found"); return 1
     print(f"Found {len(files)} file(s)")
     rc=0
     for f in files:
-        if process_one(f,a)!=0: rc=1
+        if process_one(f)!=0: rc=1
     return rc
 
 if __name__=="__main__":
