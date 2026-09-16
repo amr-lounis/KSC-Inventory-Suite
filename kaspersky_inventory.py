@@ -7,8 +7,14 @@ import requests, urllib3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ksc")
 
+def get_app_dir():
+    # when frozen (PyInstaller exe), use exe folder, otherwise script folder
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
 # ---------- settings.json handling ----------
-SETTINGS_PATH = Path(__file__).parent / "settings.json"
+SETTINGS_PATH = get_app_dir() / "settings.json"
 DEFAULT_SETTINGS = {
     "KSC_SERVER": "127.0.0.1",
     "KSC_API_PORT": 13299,
@@ -383,7 +389,11 @@ def main(argv=None):
         out.append({"host":{"display_name":display,"dn":dn,"fqdn":fqdn,"id":host_id,"instance_id":instance_id,"ip":ip_str(info.get("KLHST_WKS_IP")),"os":str(info.get("KLHST_WKS_OS_NAME") or ""),"nag_version":str(info.get("KLHST_WKS_NAG_VERSION") or ""),"last_visible":ksc_dt(info.get("KLHST_WKS_LAST_VISIBLE"))},"software":pro,"patches":pat,"summary":{"total_products":len(pro),"total_patches":len(pat)}})
         log.info(" -> %s (%s) products=%s patches=%s", display, host_id[:8], len(pro), len(pat))
     data={"generated_at":datetime.now(timezone.utc).isoformat(),"ksc_server":KSC_SERVER,"total_hosts":len(out),"hosts":out}
-    fn=a.output or f"kaspersky_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    default_fn = get_app_dir() / f"kaspersky_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    fn = Path(a.output) if a.output else default_fn
+    # if output is relative, make it relative to exe dir
+    if not fn.is_absolute():
+        fn = get_app_dir() / fn
     with open(fn,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
     log.info("Saved %s hosts=%s", fn, len(out))
     logout()

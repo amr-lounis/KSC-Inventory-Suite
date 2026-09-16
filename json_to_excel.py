@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-import json, glob, os
+import json, glob, os, sys
 from pathlib import Path
 from collections import OrderedDict
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.comments import Comment
 
+def get_app_dir():
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
 def find_all(pattern="kaspersky_inventory_*.json"):
-    files=glob.glob(pattern)
+    base = get_app_dir()
+    files = glob.glob(str(base / pattern))
     files.sort(key=os.path.getmtime)
     return files
 
@@ -101,8 +107,8 @@ def process_one(inp):
     total=sum(len(h.get("software",[])) for h in data.get("hosts",[]))
     uniq=dedup(data)
     print(f"Hosts {len(data.get('hosts',[]))} total {total} unique {len(uniq)}")
-    out=f"software_inventory_{Path(inp).stem}.xlsx"
-    write_excel(uniq,out); print(f"Saved {out}"); return 0
+    out = get_app_dir() / f"software_inventory_{Path(inp).stem}.xlsx"
+    write_excel(uniq,str(out)); print(f"Saved {out}"); return 0
 
 def main():
     files=find_all()

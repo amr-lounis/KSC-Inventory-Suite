@@ -16,7 +16,14 @@ venv/
 ENV/
 env/
 
-# Secrets
+# PyInstaller
+build/
+dist/
+*.spec
+*.exe
+*.manifest
+
+# Secrets / config
 settings.json
 settings.*.json
 !settings.example.json
@@ -24,11 +31,14 @@ settings.*.json
 *.key
 *.crt
 *.p12
-*.xlsx
 secrets.json
+.env
+.env.*
 
 # Project output - sensitive inventory
 kaspersky_inventory_*.json
+software_inventory_*.xlsx
+*.xlsx
 *.log
 
 # Archive (created by __backup.bat)
@@ -47,4 +57,3 @@ Thumbs.db
 *.tmp
 *.bak
 *.zip
-!requirements.txt
