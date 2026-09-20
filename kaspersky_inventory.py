@@ -13,6 +13,12 @@ def get_app_dir():
         return Path(sys.executable).parent
     return Path(__file__).parent
 
+def get_out_dir():
+    # كل الملفات الناتجة داخل مجلد out
+    d = get_app_dir() / "out"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 # ---------- settings.json handling ----------
 SETTINGS_PATH = get_app_dir() / "settings.json"
 DEFAULT_SETTINGS = {
@@ -389,11 +395,12 @@ def main(argv=None):
         out.append({"host":{"display_name":display,"dn":dn,"fqdn":fqdn,"id":host_id,"instance_id":instance_id,"ip":ip_str(info.get("KLHST_WKS_IP")),"os":str(info.get("KLHST_WKS_OS_NAME") or ""),"nag_version":str(info.get("KLHST_WKS_NAG_VERSION") or ""),"last_visible":ksc_dt(info.get("KLHST_WKS_LAST_VISIBLE"))},"software":pro,"patches":pat,"summary":{"total_products":len(pro),"total_patches":len(pat)}})
         log.info(" -> %s (%s) products=%s patches=%s", display, host_id[:8], len(pro), len(pat))
     data={"generated_at":datetime.now(timezone.utc).isoformat(),"ksc_server":KSC_SERVER,"total_hosts":len(out),"hosts":out}
-    default_fn = get_app_dir() / f"kaspersky_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    default_fn = get_out_dir() / f"kaspersky_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     fn = Path(a.output) if a.output else default_fn
-    # if output is relative, make it relative to exe dir
+    # if output is relative, make it relative to out dir
     if not fn.is_absolute():
-        fn = get_app_dir() / fn
+        fn = get_out_dir() / fn
+    fn.parent.mkdir(parents=True, exist_ok=True)
     with open(fn,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
     log.info("Saved %s hosts=%s", fn, len(out))
     logout()

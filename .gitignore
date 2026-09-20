@@ -35,9 +35,11 @@ secrets.json
 .env
 .env.*
 
-# Project output - sensitive inventory
+# Project output - sensitive inventory (all inside out/)
+out/
 kaspersky_inventory_*.json
 software_inventory_*.xlsx
+risk_report_*
 *.xlsx
 *.log
 

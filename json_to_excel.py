@@ -10,10 +10,16 @@ def get_app_dir():
         return Path(sys.executable).parent
     return Path(__file__).parent
 
+def get_out_dir():
+    # كل الملفات الناتجة داخل مجلد out
+    d = get_app_dir() / "out"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 def find_all(pattern="kaspersky_inventory_*.json"):
     base = get_app_dir()
-    files = glob.glob(str(base / pattern))
-    files.sort(key=os.path.getmtime)
+    files = glob.glob(str(base / pattern)) + glob.glob(str(base / "out" / pattern))
+    files = sorted(set(files), key=os.path.getmtime)
     return files
 
 def load_json(p): return json.loads(Path(p).read_text(encoding="utf-8"))
@@ -185,7 +191,7 @@ def process_one(inp):
     split, host_counts=dedup_by_os(data)
     nw=len(split["windows"]); nl=len(split["linux"]); no=len(split["other"])
     print(f"Hosts {len(data.get('hosts',[]))} (W={host_counts['windows']} L={host_counts['linux']} O={host_counts['other']}) total {total} unique W={nw} L={nl} O={no}")
-    out = get_app_dir() / f"software_inventory_{Path(inp).stem}.xlsx"
+    out = get_out_dir() / f"software_inventory_{Path(inp).stem}.xlsx"
     write_excel(split,str(out),host_counts); print(f"Saved {out}"); return 0
 
 def main():

@@ -75,6 +75,12 @@ class App(tk.Tk):
         self.btn_excel = ttk.Button(btn_frm, text="Convert JSON to Excel", command=self.run_excel)
         self.btn_excel.pack(side="left", padx=5)
 
+        self.btn_vuln = ttk.Button(btn_frm, text="Vulnerability Report", command=self.run_vuln)
+        self.btn_vuln.pack(side="left", padx=5)
+
+        self.btn_rules = ttk.Button(btn_frm, text="Update Vuln Rules", command=self.run_rules)
+        self.btn_rules.pack(side="left", padx=5)
+
         log_frm = ttk.LabelFrame(self, text="Log", padding=5)
         log_frm.pack(fill="both", expand=True, padx=10, pady=5)
         self.txt = scrolledtext.ScrolledText(log_frm, height=16, font=("Consolas", 9))
@@ -126,6 +132,8 @@ class App(tk.Tk):
         except: pass
         self.btn_run.config(state="disabled")
         self.btn_excel.config(state="disabled")
+        self.btn_vuln.config(state="disabled")
+        self.btn_rules.config(state="disabled")
         self.status.set("Running Inventory...")
         self.log("-- Starting Inventory fetch ...")
         def worker():
@@ -142,11 +150,15 @@ class App(tk.Tk):
             finally:
                 self.after(0, lambda: self.btn_run.config(state="normal"))
                 self.after(0, lambda: self.btn_excel.config(state="normal"))
+                self.after(0, lambda: self.btn_vuln.config(state="normal"))
+                self.after(0, lambda: self.btn_rules.config(state="normal"))
         threading.Thread(target=worker, daemon=True).start()
 
     def run_excel(self):
         self.btn_run.config(state="disabled")
         self.btn_excel.config(state="disabled")
+        self.btn_vuln.config(state="disabled")
+        self.btn_rules.config(state="disabled")
         self.status.set("Converting JSON to Excel...")
         self.log("-- Converting all kaspersky_inventory_*.json ...")
         def worker():
@@ -169,6 +181,83 @@ class App(tk.Tk):
             finally:
                 self.after(0, lambda: self.btn_run.config(state="normal"))
                 self.after(0, lambda: self.btn_excel.config(state="normal"))
+                self.after(0, lambda: self.btn_vuln.config(state="normal"))
+                self.after(0, lambda: self.btn_rules.config(state="normal"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_vuln(self):
+        import glob
+        base = get_app_dir()
+        files = sorted(set(glob.glob(str(base / "kaspersky_inventory_*.json")) +
+                           glob.glob(str(base / "out" / "kaspersky_inventory_*.json"))))
+        if not files:
+            messagebox.showerror("Error", "No kaspersky_inventory_*.json found")
+            return
+        latest = files[-1]
+        self.btn_run.config(state="disabled")
+        self.btn_excel.config(state="disabled")
+        self.btn_vuln.config(state="disabled")
+        self.btn_rules.config(state="disabled")
+        self.status.set("Checking vulnerabilities...")
+        self.log(f"-- Vulnerability scan on {Path(latest).name} (offline rules + cache) ...")
+        def worker():
+            try:
+                import io, contextlib, vuln_check as vc
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = vc.main([latest, "--excel"])
+                out = buf.getvalue()
+                for line in out.splitlines():
+                    self.after(0, lambda l=line: self.log(l))
+                if rc == 0:
+                    self.after(0, lambda: self.status.set("Vulnerability report done"))
+                    self.after(0, lambda: messagebox.showinfo("Done", "Risk report (JSON + Excel) saved in out/"))
+                else:
+                    self.after(0, lambda: self.status.set("Vulnerability scan failed"))
+            except Exception as e:
+                self.after(0, lambda: self.log(f"Vuln error: {e}"))
+                self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                self.after(0, lambda: self.btn_run.config(state="normal"))
+                self.after(0, lambda: self.btn_excel.config(state="normal"))
+                self.after(0, lambda: self.btn_vuln.config(state="normal"))
+                self.after(0, lambda: self.btn_rules.config(state="normal"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_rules(self):
+        if not messagebox.askyesno("Update Vuln Rules",
+                "Download endoflife.date + CISA KEV feeds and rebuild\n"
+                "upstream sections of vuln_rules.json?\n\nNeeds internet."):
+            return
+        self.btn_run.config(state="disabled")
+        self.btn_excel.config(state="disabled")
+        self.btn_vuln.config(state="disabled")
+        self.btn_rules.config(state="disabled")
+        self.status.set("Updating vuln rules from internet...")
+        self.log("-- Updating vuln_rules.json from endoflife.date + CISA KEV ...")
+        def worker():
+            try:
+                import io, contextlib, vuln_check as vc
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = vc.main(["--update-rules"])
+                out = buf.getvalue()
+                for line in out.splitlines():
+                    self.after(0, lambda l=line: self.log(l))
+                if rc == 0:
+                    self.after(0, lambda: self.status.set("Vuln rules updated"))
+                    self.after(0, lambda: messagebox.showinfo("Done", "vuln_rules.json updated from the internet"))
+                else:
+                    self.after(0, lambda: self.status.set("Rules update failed - file unchanged"))
+                    self.after(0, lambda: messagebox.showerror("Error", "Could not fetch feeds (no internet?). Rules file unchanged."))
+            except Exception as e:
+                self.after(0, lambda: self.log(f"Rules error: {e}"))
+                self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                self.after(0, lambda: self.btn_run.config(state="normal"))
+                self.after(0, lambda: self.btn_excel.config(state="normal"))
+                self.after(0, lambda: self.btn_vuln.config(state="normal"))
+                self.after(0, lambda: self.btn_rules.config(state="normal"))
         threading.Thread(target=worker, daemon=True).start()
 
 if __name__ == "__main__":
