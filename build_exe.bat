@@ -36,7 +36,7 @@ echo [4/4] Building EXE (gui.py)...
 :: --windowed : no console (GUI only)
 :: --name : output name
 :: --add-data : include example settings
-pyinstaller --noconfirm --onefile --windowed --name KasperskyInventory --add-data "settings.example.json;." --hidden-import openpyxl --hidden-import et_xmlfile gui.py
+pyinstaller --noconfirm --onefile --windowed --name KasperskyInventory --add-data "settings.example.json;." --hidden-import openpyxl --hidden-import et_xmlfile --hidden-import vuln_check --hidden-import vuln_update gui.py
 
 if errorlevel 1 (
     echo.
