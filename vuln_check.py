@@ -64,10 +64,19 @@ def strip_accents(s):
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 
+_WS_RE = re.compile(r"\s+")
+_TOK_RE = re.compile(r"[^a-z0-9]+")
+_NUM_RE = re.compile(r"\d+")
+
+
+def split_tokens(s, min_len=5, generic=()):
+    return {t for t in _TOK_RE.split(s) if len(t) >= min_len and t not in generic}
+
+
 def normalize_name(name, rules=None):
     s = strip_accents(str(name or "").lower())
     s = s.replace("�", "").replace("\x00", " ")
-    s = re.sub(r"\s+", " ", s).strip()
+    s = _WS_RE.sub(" ", s).strip()
     if rules:
         for k, v in (rules.get("aliases") or {}).items():
             if k in s:
@@ -88,10 +97,22 @@ def is_noise(norm_name, rules):
 
 
 def parse_version(s):
-    parts = re.findall(r"\d+", str(s or ""))
+    parts = _NUM_RE.findall(str(s or ""))
     if not parts:
         return ()
     return tuple(int(x) for x in parts[:6])
+
+
+_VER_CACHE = {}
+
+def parse_version_cached(s):
+    key = str(s or "")
+    v = _VER_CACHE.get(key)
+    if v is None:
+        v = parse_version(key)
+        if len(_VER_CACHE) < 50000:
+            _VER_CACHE[key] = v
+    return v
 
 
 def cmp_versions(a, b):
@@ -148,7 +169,7 @@ def assess(name, version, publisher="", rules=None, kev=None, host_count=0):
     key = fam or norm
     if key in min_versions and version and str(version).strip():
         entry = min_versions[key]
-        cur, minimum = parse_version(version), parse_version(entry.get("min", ""))
+        cur, minimum = parse_version_cached(version), parse_version_cached(entry.get("min", ""))
         if cur and minimum and cmp_versions(cur, minimum) < 0:
             gap = minimum[0] - cur[0] if len(minimum) > 0 and len(cur) > 0 else 0
             if fam in ("google chrome", "microsoft edge", "mozilla firefox", "opera"):
@@ -173,7 +194,7 @@ def assess(name, version, publisher="", rules=None, kev=None, host_count=0):
             latest_major = int(up_latest[fam].get("major", 0))
         except (TypeError, ValueError):
             latest_major = 0
-        cur = parse_version(version)
+        cur = parse_version_cached(version)
         if cur and latest_major and cur[0] > 0 and cur[0] < latest_major:
             gap = latest_major - cur[0]
             if fam in ("google chrome", "microsoft edge", "mozilla firefox", "opera"):
@@ -185,9 +206,14 @@ def assess(name, version, publisher="", rules=None, kev=None, host_count=0):
             actions.append("Update to the latest release")
 
     if kev:
-        hits = match_kev(norm, str(publisher or ""), kev, rules)
-        if hits:
-            first = hits[0]
+        if kev and isinstance(kev[0], tuple):
+            kev_index = kev  # prebuilt by analyze()
+        else:
+            kev_index = build_kev_index(kev, rules)
+        generic = set(rules.get("generic_tokens") or ())
+        first = match_kev_first(norm, normalize_name(publisher or ""),
+                                split_tokens(norm, generic=generic), kev_index)
+        if first is not None:
             note = (f"CISA KEV: {first['cveID']} - {first.get('product', '')} "
                     f"({first.get('vulnerabilityName', '')[:80]})")
             if score >= 7:
@@ -210,31 +236,31 @@ def assess(name, version, publisher="", rules=None, kev=None, host_count=0):
     return {"score": score, "level": level_of(score), "reasons": reasons, "action": "; ".join(dict.fromkeys(actions))}
 
 
-def match_kev(norm_name, publisher, kev_list, rules=None):
-    """Match KEV product/vendor against software name.
-
-    Requires a meaningful (non-generic) token overlap to avoid attributing
-    e.g. Exchange CVEs to Edge just because both are 'Microsoft'.
-    """
+def build_kev_index(kev_list, rules=None):
+    """Precompute normalized KEV data once (was re-normalized per software item)."""
     generic = set((rules or {}).get("generic_tokens") or ())
-    hits = []
-    pub = normalize_name(publisher)
-    tokens = {t for t in re.split(r"[^a-z0-9]+", norm_name) if len(t) >= 5 and t not in generic}
-    for entry in kev_list:
+    index = []
+    for entry in kev_list or []:
         prod = normalize_name(entry.get("product", ""))
-        vend = normalize_name(entry.get("vendorProject", ""))
         if not prod:
             continue
+        vend = normalize_name(entry.get("vendorProject", ""))
+        overlap = {t for t in _TOK_RE.split(prod) if len(t) >= 5 and t not in generic}
+        index.append((entry, prod, vend, overlap))
+    return index
+
+
+def match_kev_first(norm_name, pub_norm, tokens, kev_index):
+    """Return first matching KEV entry (assess only uses the first hit)."""
+    for entry, prod, vend, overlap in kev_index:
         if prod in norm_name:
-            hits.append(entry)
-        elif len(prod) >= 6 and any(prod in t or t in prod for t in tokens):
-            if not vend or vend in norm_name or vend in pub:
-                hits.append(entry)
-        elif vend and (vend in norm_name or vend in pub):
-            overlap = {t for t in re.split(r"[^a-z0-9]+", prod) if len(t) >= 5 and t not in generic}
-            if overlap & tokens:
-                hits.append(entry)
-    return hits
+            return entry
+        if len(prod) >= 6 and any(prod in t or t in prod for t in tokens):
+            if not vend or vend in norm_name or vend in pub_norm:
+                return entry
+        if vend and (vend in norm_name or vend in pub_norm) and overlap & tokens:
+            return entry
+    return None
 
 
 def load_kev_cache():
@@ -388,15 +414,27 @@ def is_past(eol_str, today):
 
 def build_upstream_entries(today=None):
     """Fetch endoflife.date and build (upstream_eol, upstream_latest, products_ok)."""
+    from concurrent.futures import ThreadPoolExecutor
     from datetime import date
     today = today or date.today()
     upstream_eol, upstream_latest, products_ok = [], {}, []
     all_products = list(EOL_UPSTREAM_PRODUCTS) + list(EVERGREEN_UPSTREAM)
-    for product in all_products:
+
+    def _fetch(product):
         try:
-            releases = fetch_eol_product(product)
+            return product, fetch_eol_product(product), None
         except Exception as e:
-            print(f"  [skip] {product}: {e}")
+            return product, [], str(e)
+
+    # parallel downloads (I/O bound), results merged in fixed product order
+    fetched = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for product, releases, err in ex.map(_fetch, all_products):
+            fetched[product] = (releases, err)
+    for product in all_products:
+        releases, err = fetched[product]
+        if err is not None:
+            print(f"  [skip] {product}: {err}")
             continue
         if not releases:
             print(f"  [skip] {product}: empty response")
@@ -463,13 +501,22 @@ def build_upstream_entries(today=None):
     return upstream_eol, upstream_latest, products_ok
 
 
+REQUIRED_RULE_SECTIONS = ("eol_os", "eol_products", "min_safe_versions", "family_patterns",
+                            "aliases", "noise_patterns", "generic_tokens")
+
+
 def update_rules_from_upstream(rules_path=None):
     """Download standard feeds and refresh upstream sections of vuln_rules.json."""
     rules_path = Path(rules_path) if rules_path else resource_path("vuln_rules.json")
     try:
         rules = json.loads(rules_path.read_text(encoding="utf-8"))
-    except Exception:
-        rules = {}
+    except Exception as e:
+        print(f"ERROR: cannot read {rules_path} ({e}) - rules unchanged")
+        return 1
+    missing = [k for k in REQUIRED_RULE_SECTIONS if not rules.get(k)]
+    if missing:
+        print(f"ERROR: {rules_path} missing sections {missing} - refusing to overwrite")
+        return 1
     print("Fetching endoflife.date ...")
     upstream_eol, upstream_latest, products_ok = build_upstream_entries()
     if not products_ok and not upstream_eol:
@@ -487,7 +534,15 @@ def update_rules_from_upstream(rules_path=None):
     src["cisa_kev"] = {"url": KEV_URL, "fetched_at": date.today().isoformat(),
                        "entries": len(kev)}
     rules["sources"] = src
-    rules_path.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
+    # backup + atomic write (never leave a half-written rules file)
+    try:
+        backup = rules_path.with_name(rules_path.stem + ".bak.json")
+        backup.write_text(rules_path.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception as e:
+        print(f"Warning: backup failed ({e})")
+    tmp = rules_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(rules_path)
     n_os = sum(1 for e in upstream_eol if e.get("kind") == "os")
     print(f"Saved {rules_path}: upstream_eol={len(upstream_eol)} (os={n_os}, app={len(upstream_eol)-n_os}) "
           f"upstream_latest={upstream_latest}")
@@ -516,6 +571,8 @@ def find_eol_hosts(data, rules):
 def analyze(data, rules, kev=None):
     """Aggregate software across hosts and assess each (name, version)."""
     from collections import OrderedDict
+    kev_index = build_kev_index(kev, rules) if kev else []
+    norm_cache = {}
     agg = OrderedDict()
     for h in data.get("hosts", []):
         info = h.get("host", {}) if isinstance(h.get("host"), dict) else {}
@@ -538,8 +595,11 @@ def analyze(data, rules, kev=None):
                 e["hosts"].append(hid)
     items = []
     for (nl, ver), e in agg.items():
-        r = assess(e["name"], ver, e["publisher"], rules, kev, e["count"])
-        items.append({**e, "family": family_of(normalize_name(e["name"], rules), rules),
+        r = assess(e["name"], ver, e["publisher"], rules, kev_index, e["count"])
+        nn = norm_cache.get(nl)
+        if nn is None:
+            nn = norm_cache[nl] = normalize_name(e["name"], rules)
+        items.append({**e, "family": family_of(nn, rules),
                       "score": r["score"], "level": r["level"],
                       "reasons": r["reasons"], "action": r["action"], "cves": []})
     items.sort(key=lambda x: (-x["score"], -x["count"], x["name"]))
