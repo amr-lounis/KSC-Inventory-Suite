@@ -14,14 +14,23 @@ import time
 import unicodedata
 import urllib.request
 import urllib.parse
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from vuln_update import (  # update engine lives in its own module
     get_app_dir, get_out_dir, resource_path, cache_path, load_kev_cache, fetch_kev)
 
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 NVD_DELAY = 7  # seconds between NVD calls without API key
+
+# Score thresholds (single source of truth for level_of + RISK_COLORS)
+RISK_LEVELS = ("Critical", "High", "Medium", "Low", "Safe")
+RISK_MIN_SCORE = {"Critical": 9, "High": 7, "Medium": 4, "Low": 1, "Safe": 0}
+RISK_COLORS = {"Critical": "C00000", "High": "ED7D31", "Medium": "FFC000",
+               "Low": "FFF2CC", "Safe": "E2EFDA"}
+EVERGREEN_BROWSERS = ("google chrome", "microsoft edge", "mozilla firefox", "opera")
 
 
 def load_rules(path=None):
@@ -96,14 +105,9 @@ def cmp_versions(a, b):
 
 
 def level_of(score):
-    if score >= 9:
-        return "Critical"
-    if score >= 7:
-        return "High"
-    if score >= 4:
-        return "Medium"
-    if score >= 1:
-        return "Low"
+    for level in RISK_LEVELS:
+        if score >= RISK_MIN_SCORE[level]:
+            return level
     return "Safe"
 
 
@@ -118,16 +122,9 @@ def entry_matches(norm, entry):
     return False
 
 
-def assess(name, version, publisher="", rules=None, kev=None, host_count=0):
-    """Return dict(score, level, reasons[], action). Pure offline unless kev given."""
-    rules = rules or {}
-    norm = normalize_name(name, rules)
-    reasons, actions = [], []
-    score = 0
-
-    if not norm or is_noise(norm, rules):
-        return {"score": 0, "level": "Safe", "reasons": ["Noise/OS update entry - excluded"], "action": "-"}
-
+def _check_eol(norm: str, rules: dict) -> Tuple[int, List[str], List[str]]:
+    """Static + upstream EOL matches. Returns (score, reasons, actions)."""
+    score, reasons, actions = 0, [], []
     for item in (rules.get("eol_products") or []) + (rules.get("upstream_eol") or []):
         if item.get("kind", "app") != "app":
             continue
@@ -136,77 +133,137 @@ def assess(name, version, publisher="", rules=None, kev=None, host_count=0):
             reasons.append(item.get("label", item.get("match", "?")))
             if item.get("action"):
                 actions.append(item["action"])
+    return score, reasons, actions
 
-    fam = family_of(norm, rules)
-    min_versions = rules.get("min_safe_versions") or {}
+
+def _browser_gap_score(gap: int, major_gap_only: bool) -> int:
+    if major_gap_only:
+        return 9 if gap >= 6 else (8 if gap >= 3 else 6)
+    return 9 if gap >= 10 else 8
+
+
+def _check_min_version(norm: str, fam: Optional[str], version: str, name: str,
+                       rules: dict) -> Tuple[int, List[str], List[str]]:
+    """Curated minimum-safe-version comparison."""
+    score, reasons, actions = 0, [], []
     key = fam or norm
-    if key in min_versions and version and str(version).strip():
-        entry = min_versions[key]
-        cur, minimum = parse_version_cached(version), parse_version_cached(entry.get("min", ""))
-        if cur and minimum and cmp_versions(cur, minimum) < 0:
-            gap = minimum[0] - cur[0] if len(minimum) > 0 and len(cur) > 0 else 0
-            if fam in ("google chrome", "microsoft edge", "mozilla firefox", "opera"):
-                s = 9 if gap >= 10 or (len(cur) > 1 and len(minimum) > 1 and minimum[0] == cur[0] and minimum[1] - cur[1] >= 30) else 8
-                if cur and cur[0] <= 109:
-                    s = 9
-            elif gap >= 2:
-                s = 8
-            elif gap == 1:
-                s = 6
-            else:
-                s = 5
-            score = max(score, s)
-            reasons.append(f"Outdated: {version} < minimum safe {entry['min']} ({fam or name})")
-            if entry.get("action"):
-                actions.append(entry["action"])
+    entry = (rules.get("min_safe_versions") or {}).get(key)
+    if not (entry and version and str(version).strip()):
+        return score, reasons, actions
+    cur = parse_version_cached(version)
+    minimum = parse_version_cached(entry.get("min", ""))
+    if not (cur and minimum and cmp_versions(cur, minimum) < 0):
+        return score, reasons, actions
+    gap = minimum[0] - cur[0] if len(minimum) > 0 and len(cur) > 0 else 0
+    if fam in EVERGREEN_BROWSERS:
+        s = _browser_gap_score(gap, major_gap_only=False)
+        if gap < 10 and len(cur) > 1 and len(minimum) > 1 \
+                and minimum[0] == cur[0] and minimum[1] - cur[1] >= 30:
+            s = 9
+        if cur and cur[0] <= 109:
+            s = 9
+    elif gap >= 2:
+        s = 8
+    elif gap == 1:
+        s = 6
+    else:
+        s = 5
+    score = max(score, s)
+    reasons.append(f"Outdated: {version} < minimum safe {entry['min']} ({fam or name})")
+    if entry.get("action"):
+        actions.append(entry["action"])
+    return score, reasons, actions
 
-    # Upstream freshness (endoflife.date): evergreen families vs latest known major
+
+def _check_freshness(fam: Optional[str], version: str,
+                     rules: dict) -> Tuple[int, List[str], List[str]]:
+    """endoflife.date evergreen families vs latest known major."""
+    score, reasons, actions = 0, [], []
     up_latest = rules.get("upstream_latest") or {}
-    if fam in up_latest and version and str(version).strip():
-        try:
-            latest_major = int(up_latest[fam].get("major", 0))
-        except (TypeError, ValueError):
-            latest_major = 0
-        cur = parse_version_cached(version)
-        if cur and latest_major and cur[0] > 0 and cur[0] < latest_major:
-            gap = latest_major - cur[0]
-            if fam in ("google chrome", "microsoft edge", "mozilla firefox", "opera"):
-                s = 9 if gap >= 6 else (8 if gap >= 3 else 6)
-            else:
-                s = 8 if gap >= 2 else 6
-            score = max(score, s)
-            reasons.append(f"Outdated vs upstream: {version} (latest {fam} major {latest_major}, endoflife.date)")
-            actions.append("Update to the latest release")
+    if not (fam in up_latest and version and str(version).strip()):
+        return score, reasons, actions
+    try:
+        latest_major = int(up_latest[fam].get("major", 0))
+    except (TypeError, ValueError):
+        latest_major = 0
+    cur = parse_version_cached(version)
+    if not (cur and latest_major and cur[0] > 0 and cur[0] < latest_major):
+        return score, reasons, actions
+    gap = latest_major - cur[0]
+    if fam in EVERGREEN_BROWSERS:
+        s = _browser_gap_score(gap, major_gap_only=True)
+    else:
+        s = 8 if gap >= 2 else 6
+    score = max(score, s)
+    reasons.append(f"Outdated vs upstream: {version} (latest {fam} major {latest_major}, endoflife.date)")
+    actions.append("Update to the latest release")
+    return score, reasons, actions
+
+
+def _check_kev(norm: str, publisher: str, score: int, rules: dict,
+               kev_index: list) -> Tuple[int, List[str], List[str]]:
+    """CISA KEV: bump only with existing evidence; informational otherwise."""
+    reasons, actions = [], []
+    generic = set(rules.get("generic_tokens") or ())
+    first = match_kev_first(norm, normalize_name(publisher or ""),
+                            split_tokens(norm, generic=generic), kev_index)
+    if first is None:
+        return score, reasons, actions
+    note = (f"CISA KEV: {first['cveID']} - {first.get('product', '')} "
+            f"({first.get('vulnerabilityName', '')[:80]})")
+    if score >= 7:
+        # outdated/EOL + actively exploited -> Critical
+        score = 10
+        reasons.append(note + " [actively exploited - patch now]")
+        actions.append("Patch immediately (actively exploited in the wild)")
+    elif score > 0:
+        reasons.append(note + " [verify installed version is patched]")
+    else:
+        # current version, but product family has exploited CVEs -> informational
+        score = max(score, 3)
+        reasons.append(note + " [product family in KEV - keep updated]")
+        actions.append("Keep updated (product family in CISA KEV)")
+    return score, reasons, actions
+
+
+def assess(name: str, version: str, publisher: str = "",
+           rules: Optional[dict] = None, kev=None) -> dict:
+    """Score one (name, version). Pure offline unless kev index given.
+
+    Each check is independent - add new sources as _check_* helpers.
+    """
+    rules = rules or {}
+    norm = normalize_name(name, rules)
+    if not norm or is_noise(norm, rules):
+        return {"score": 0, "level": "Safe", "reasons": ["Noise/OS update entry - excluded"], "action": "-"}
+    fam = family_of(norm, rules)
+    ver = str(version or "").strip()
+
+    checks = [
+        _check_eol(norm, rules),
+        _check_min_version(norm, fam, ver, name, rules),
+        _check_freshness(fam, ver, rules),
+    ]
+    score = 0
+    reasons: List[str] = []
+    actions: List[str] = []
+    for s, rs, acts in checks:
+        score = max(score, s)
+        reasons.extend(rs)
+        actions.extend(acts)
 
     if kev:
-        if kev and isinstance(kev[0], tuple):
-            kev_index = kev  # prebuilt by analyze()
-        else:
-            kev_index = build_kev_index(kev, rules)
-        generic = set(rules.get("generic_tokens") or ())
-        first = match_kev_first(norm, normalize_name(publisher or ""),
-                                split_tokens(norm, generic=generic), kev_index)
-        if first is not None:
-            note = (f"CISA KEV: {first['cveID']} - {first.get('product', '')} "
-                    f"({first.get('vulnerabilityName', '')[:80]})")
-            if score >= 7:
-                # outdated/EOL + actively exploited -> Critical
-                score = 10
-                reasons.append(note + " [actively exploited - patch now]")
-                actions.append("Patch immediately (actively exploited in the wild)")
-            elif score > 0:
-                reasons.append(note + " [verify installed version is patched]")
-            else:
-                # current version, but product family has exploited CVEs -> informational
-                score = max(score, 3)
-                reasons.append(note + " [product family in KEV - keep updated]")
-                actions.append("Keep updated (product family in CISA KEV)")
+        kev_index = kev if (kev and isinstance(kev[0], tuple)) else build_kev_index(kev, rules)
+        score, rs, acts = _check_kev(norm, publisher, score, rules, kev_index)
+        reasons.extend(rs)
+        actions.extend(acts)
 
     if not reasons:
         return {"score": 0, "level": "Safe", "reasons": [], "action": "-"}
     if not actions:
         actions.append("Update to a supported version")
-    return {"score": score, "level": level_of(score), "reasons": reasons, "action": "; ".join(dict.fromkeys(actions))}
+    return {"score": score, "level": level_of(score),
+            "reasons": reasons, "action": "; ".join(dict.fromkeys(actions))}
 
 
 def build_kev_index(kev_list, rules=None):
@@ -280,7 +337,7 @@ def enrich_nvd(items, rules, top=30, cache_file=None, api_key=None):
             continue
         try:
             data = nvd_search(q, api_key=api_key)
-            toks = [t for t in re.split(r"[^a-z0-9]+", normalize_name(q)) if len(t) >= 3 and t not in generic]
+            toks = [t for t in _TOK_RE.split(normalize_name(q)) if len(t) >= 3 and t not in generic]
             found = []
             for v in (data.get("vulnerabilities") or [])[:20]:
                 cve = v.get("cve", {})
@@ -303,8 +360,6 @@ def enrich_nvd(items, rules, top=30, cache_file=None, api_key=None):
         except Exception as e:
             print(f"  [{i}/{len(cands)}] {q[:50]}: NVD failed ({e})")
             it["cves"] = cache.get(q, [])
-        if q not in cache or True:
-            pass
         time.sleep(1 if api_key else NVD_DELAY)
     try:
         cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -318,8 +373,6 @@ def update_rules_from_upstream(rules_path=None):
     from vuln_update import update_rules_from_upstream as _update
     return _update(rules_path)
 
-# Built-in seed: used to CREATE vuln_rules.json when missing (then enriched from internet).
-# Same content as the shipped vuln_rules.json static sections.
 def find_eol_hosts(data, rules):
     """Hosts whose OS matches EOL list (or empty OS). Returns list of dicts."""
     eol_entries = [e for e in (rules.get("eol_os") or [])] + \
@@ -341,7 +394,6 @@ def find_eol_hosts(data, rules):
 
 def analyze(data, rules, kev=None):
     """Aggregate software across hosts and assess each (name, version)."""
-    from collections import OrderedDict
     kev_index = build_kev_index(kev, rules) if kev else []
     norm_cache = {}
     agg = OrderedDict()
@@ -366,7 +418,7 @@ def analyze(data, rules, kev=None):
                 e["hosts"].append(hid)
     items = []
     for (nl, ver), e in agg.items():
-        r = assess(e["name"], ver, e["publisher"], rules, kev_index, e["count"])
+        r = assess(e["name"], ver, e["publisher"], rules, kev_index)
         nn = norm_cache.get(nl)
         if nn is None:
             nn = norm_cache[nl] = normalize_name(e["name"], rules)
@@ -398,11 +450,8 @@ def write_risk_excel(items, eol_hosts, summary, out):
     bd = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    fills = {"Critical": PatternFill(start_color="C00000", end_color="C00000", fill_type="solid"),
-             "High": PatternFill(start_color="ED7D31", end_color="ED7D31", fill_type="solid"),
-             "Medium": PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid"),
-             "Low": PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),
-             "Safe": PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")}
+    fills = {lv: PatternFill(start_color=RISK_COLORS[lv], end_color=RISK_COLORS[lv], fill_type="solid")
+             for lv in RISK_LEVELS}
 
     ws = wb.active
     ws.title = "Summary"
@@ -466,6 +515,17 @@ def write_risk_excel(items, eol_hosts, summary, out):
     wb.save(out)
 
 
+USAGE = """Usage: py vuln_check.py <input.json> [-o report.json] [--excel] [--online]
+       py vuln_check.py --update-rules
+
+Analyze one Kaspersky inventory JSON for vulnerable/EOL software.
+
+Examples:
+  py vuln_check.py out\\kaspersky_inventory_20260916_141859.json --excel
+  py vuln_check.py out\\kaspersky_inventory_20260916_141859.json -o out\\my_report.json --online
+
+Paths can also be driven from gui.py (Vulnerability Report button)."""
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="Vulnerability triage for KSC inventory JSON")
@@ -482,7 +542,8 @@ def main(argv=None):
     if a.update_rules:
         return update_rules_from_upstream(a.rules)
     if not a.input:
-        ap.error("input is required (or use --update-rules)")
+        print(USAGE)
+        return 1
 
     rules = load_rules(a.rules)
     data = json.loads(Path(a.input).read_text(encoding="utf-8"))

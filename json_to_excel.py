@@ -76,21 +76,6 @@ def dedup_by_os(data):
         split[cat] = OrderedDict(sorted(split[cat].items(), key=lambda kv: (kv[0][0], kv[0][1])))
     return split, host_counts
 
-def dedup(data):
-    # توافق قديم: دمج الكل بدون تقسيم (يُستخدم داخلياً فقط عند الحاجة)
-    split, _ = dedup_by_os(data)
-    merged = OrderedDict()
-    for cat in ("windows", "linux", "other"):
-        for key, v in split[cat].items():
-            if key not in merged:
-                merged[key] = {"name": v["name"], "version": v["version"],
-                               "publisher": v["publisher"], "count": 0, "hosts": []}
-            merged[key]["count"] += v["count"]
-            for hn in v["hosts"]:
-                if hn not in merged[key]["hosts"]:
-                    merged[key]["hosts"].append(hn)
-    return OrderedDict(sorted(merged.items(), key=lambda kv: (kv[0][0], kv[0][1])))
-
 def _write_software_sheet(ws, uniq, hdr_font, hdr_fill, bd, center, left):
     headers = ["Software Name", "Version", "Publisher", "Hosts Count"]
     ws.append(headers)
@@ -114,7 +99,6 @@ def _write_software_sheet(ws, uniq, hdr_font, hdr_fill, bd, center, left):
 
 def _write_hosts_sheet(ws, uniq, hdr_font, hdr_fill, bd, center, left):
     col = 1
-    max_rows = 1
     for v in uniq.values():
         hdr = f"{v['name']}"
         if v["version"]:
@@ -128,7 +112,6 @@ def _write_hosts_sheet(ws, uniq, hdr_font, hdr_fill, bd, center, left):
             ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 22
         except Exception:
             pass
-        max_rows = max(max_rows, len(v["hosts"]) + 1)
         col += 1
     if uniq:
         ws.freeze_panes = "A2"
@@ -184,25 +167,42 @@ def write_excel(split_or_uniq, out, host_counts=None):
 
     wb.save(out)
 
-def process_one(inp):
+def process_one(inp, out=None):
     print(f"\nInput: {inp}")
     data=load_json(inp)
     total=sum(len(h.get("software",[])) for h in data.get("hosts",[]))
     split, host_counts=dedup_by_os(data)
     nw=len(split["windows"]); nl=len(split["linux"]); no=len(split["other"])
     print(f"Hosts {len(data.get('hosts',[]))} (W={host_counts['windows']} L={host_counts['linux']} O={host_counts['other']}) total {total} unique W={nw} L={nl} O={no}")
-    out = get_out_dir() / f"software_inventory_{Path(inp).stem}.xlsx"
+    if out is None:
+        out = get_out_dir() / f"software_inventory_{Path(inp).stem}.xlsx"
+    else:
+        out = Path(out)
+        if not out.is_absolute():
+            out = get_out_dir() / out
+        out.parent.mkdir(parents=True, exist_ok=True)
     write_excel(split,str(out),host_counts); print(f"Saved {out}"); return 0
 
-def main():
-    files=find_all()
-    if not files:
-        print("No kaspersky_inventory_*.json found"); return 1
-    print(f"Found {len(files)} file(s)")
-    rc=0
-    for f in files:
-        if process_one(f)!=0: rc=1
-    return rc
+USAGE = """Usage: py json_to_excel.py <input.json> [-o output.xlsx]
+
+Converts one Kaspersky inventory JSON to Excel (split by OS).
+
+Example:
+  py json_to_excel.py out\\kaspersky_inventory_20260916_141859.json -o out\\software_inventory.xlsx
+
+Paths can also be driven from gui.py (Convert button)."""
+
+def main(argv=None):
+    """Single-file mode only: needs input, optional -o. No args -> usage."""
+    import argparse
+    ap = argparse.ArgumentParser(description="Convert Kaspersky inventory JSON to Excel (split by OS)")
+    ap.add_argument("input", nargs="?", help="input JSON file")
+    ap.add_argument("-o", "--output", help="output XLSX path (default: out/software_inventory_<name>.xlsx)")
+    a = ap.parse_args(argv)
+    if not a.input:
+        print(USAGE)
+        return 1
+    return process_one(a.input, a.output)
 
 if __name__=="__main__":
     raise SystemExit(main())

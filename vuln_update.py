@@ -20,6 +20,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+UA = {"User-Agent": "ksc-inventory/1.0"}
+UPDATE_WORKERS = 8  # parallel endoflife.date downloads (I/O bound)
 
 UA = {"User-Agent": "ksc-inventory/1.0"}
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
@@ -177,14 +181,23 @@ def cache_path(name):
     return get_out_dir() / name
 
 
+_PAREN_RE = re.compile(r"\(.*?\)")
+_WS_RE = re.compile(r"\s+")
+_MAJOR_RE = re.compile(r"(\d+)")
+
+
 def strip_accents(s):
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 
 def clean_label(label):
     s = strip_accents(str(label or "").lower())
-    s = re.sub(r"\(.*?\)", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+    s = _PAREN_RE.sub(" ", s)
+    return _WS_RE.sub(" ", s).strip()
+
+
+def first_token(release) -> str:
+    return (clean_label(release.get("releaseLabel") or release.get("cycle")).split() or ["?"])[0]
 
 
 def is_past(eol_str, today):
@@ -229,11 +242,8 @@ def fetch_kev(timeout=30):
         return load_kev_cache()
 
 
-def build_upstream_entries(today=None):
-    """Fetch endoflife.date and build (upstream_eol, upstream_latest, products_ok)."""
-    today = today or date.today()
-    upstream_eol, upstream_latest, products_ok = [], {}, []
-    all_products = list(EOL_UPSTREAM_PRODUCTS) + list(EVERGREEN_UPSTREAM)
+def _download_all(all_products: List[str]) -> Dict[str, tuple]:
+    """Parallel downloads; returns {product: (releases, error)} in fixed order."""
 
     def _fetch(product):
         try:
@@ -241,11 +251,84 @@ def build_upstream_entries(today=None):
         except Exception as e:
             return product, [], str(e)
 
-    # parallel downloads (I/O bound), results merged in fixed product order
     fetched = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=UPDATE_WORKERS) as ex:
         for product, releases, err in ex.map(_fetch, all_products):
             fetched[product] = (releases, err)
+    return fetched
+
+
+def _windows_major_entries(releases: list, today) -> List[dict]:
+    """Bare-major matches only when the whole major line is EOL (7/8/8.1/XP/Vista),
+    never for 10/11 (supported editions exist and KSC strings lack build numbers)."""
+    by_major: Dict[str, dict] = {}
+    for x in releases:
+        tok = first_token(x)
+        st = by_major.setdefault(tok, {"eol": 0, "total": 0})
+        st["total"] += 1
+        if x.get("eol") and is_past(x.get("eol"), today):
+            st["eol"] += 1
+    entries = []
+    for tok, st in sorted(by_major.items()):
+        if st["eol"] == st["total"]:
+            eol_date = max(x["eol"] for x in releases if first_token(x) == tok)
+            entries.append({
+                "match_all": ["windows", tok], "kind": "os", "score": 10,
+                "label": f"Windows {tok.upper()} (EOL {eol_date}, endoflife.date)",
+                "eol": eol_date, "product": "windows",
+                "action": "Upgrade/Migrate to a supported Windows"})
+    return entries
+
+
+def _labeled_entries(product: str, kind: str, keyword: Optional[str], use_cycle: bool,
+                     eol_rels: list) -> List[dict]:
+    entries = []
+    for x in eol_rels:
+        raw = x.get("releaseLabel") or x.get("cycle") or ""
+        norm = clean_label(raw)
+        if use_cycle:
+            cyc = clean_label(x.get("cycle")).split()
+            token = cyc[0] if cyc else (norm.split()[0] if norm.split() else "")
+        else:
+            token = norm.split()[0] if norm.split() else ""
+        if keyword:
+            entry: dict = {"match_all": [keyword, token] if token else [keyword]}
+        elif len(norm) >= 6 and not norm.replace(".", "").replace("-", "").isdigit():
+            entry = {"match": norm}
+        elif token:
+            entry = {"match_all": [product.replace("-", " "), token]}
+        else:
+            continue
+        entry.update({
+            "kind": kind, "score": 10 if kind == "os" else 9,
+            "label": f"{raw} (EOL {x['eol']}, endoflife.date)",
+            "eol": x["eol"], "product": product,
+            "action": "Upgrade/Migrate to a supported OS" if kind == "os"
+                      else "Upgrade to a supported version"})
+        entries.append(entry)
+    return entries
+
+
+def _evergreen_latest(product: str, releases: list, today) -> Optional[dict]:
+    majors = []
+    for x in releases:
+        if x.get("eol") and is_past(x.get("eol"), today):
+            continue
+        m = _MAJOR_RE.match(clean_label(x.get("releaseLabel") or x.get("cycle")))
+        if m:
+            majors.append(int(m.group(1)))
+    if not majors:
+        return None
+    return {"major": max(majors), "checked": today.isoformat(),
+            "source": f"endoflife.date/{product}"}
+
+
+def build_upstream_entries(today=None):
+    """Fetch endoflife.date and build (upstream_eol, upstream_latest, products_ok)."""
+    today = today or date.today()
+    upstream_eol, upstream_latest, products_ok = [], {}, []
+    all_products = list(EOL_UPSTREAM_PRODUCTS) + list(EVERGREEN_UPSTREAM)
+    fetched = _download_all(all_products)
     for product in all_products:
         releases, err = fetched[product]
         if err is not None:
@@ -256,86 +339,57 @@ def build_upstream_entries(today=None):
             continue
         products_ok.append(product)
         kind, keyword, use_cycle = EOL_UPSTREAM_PRODUCTS.get(product, ("app", None, False))
-
         eol_rels = [x for x in releases if x.get("eol") and is_past(x.get("eol"), today)]
         if product == "windows":
-            # bare-major matches only when the whole major line is EOL (7/8/8.1/XP/Vista),
-            # never for 10/11 (supported editions exist and KSC strings lack build numbers)
-            by_major = {}
-            for x in releases:
-                tok = (clean_label(x.get("releaseLabel") or x.get("cycle")).split() or ["?"])[0]
-                by_major.setdefault(tok, {"eol": 0, "total": 0})
-                by_major[tok]["total"] += 1
-                if x.get("eol") and is_past(x.get("eol"), today):
-                    by_major[tok]["eol"] += 1
-            for tok, st in sorted(by_major.items()):
-                if st["eol"] == st["total"]:
-                    eol_date = max(x["eol"] for x in releases
-                                   if (clean_label(x.get("releaseLabel") or x.get("cycle")).split() or ["?"])[0] == tok)
-                    upstream_eol.append({
-                        "match_all": ["windows", tok], "kind": "os", "score": 10,
-                        "label": f"Windows {tok.upper()} (EOL {eol_date}, endoflife.date)",
-                        "eol": eol_date, "product": "windows",
-                        "action": "Upgrade/Migrate to a supported Windows"})
+            upstream_eol.extend(_windows_major_entries(releases, today))
         else:
-            for x in eol_rels:
-                raw = x.get("releaseLabel") or x.get("cycle") or ""
-                norm = clean_label(raw)
-                token = (clean_label(x.get("cycle")).split() or [norm.split()[0] if norm.split() else ""])[0] \
-                    if use_cycle else (norm.split()[0] if norm.split() else "")
-                if keyword:
-                    entry = {"match_all": [keyword, token] if token else [keyword]}
-                elif len(norm) >= 6 and not norm.replace(".", "").replace("-", "").isdigit():
-                    entry = {"match": norm}
-                elif token:
-                    entry = {"match_all": [product.replace("-", " "), token]}
-                else:
-                    continue
-                entry.update({
-                    "kind": kind, "score": 10 if kind == "os" else 9,
-                    "label": f"{raw} (EOL {x['eol']}, endoflife.date)",
-                    "eol": x["eol"], "product": product,
-                    "action": "Upgrade/Migrate to a supported OS" if kind == "os"
-                              else "Upgrade to a supported version"})
-                upstream_eol.append(entry)
-
+            upstream_eol.extend(_labeled_entries(product, kind, keyword, use_cycle, eol_rels))
         if product in EVERGREEN_UPSTREAM:
-            majors = []
-            for x in releases:
-                if x.get("eol") and is_past(x.get("eol"), today):
-                    continue
-                lab = clean_label(x.get("releaseLabel") or x.get("cycle"))
-                m = re.match(r"(\d+)", lab)
-                if m:
-                    majors.append(int(m.group(1)))
-            if majors:
-                upstream_latest[EVERGREEN_UPSTREAM[product]] = {
-                    "major": max(majors), "checked": today.isoformat(),
-                    "source": f"endoflife.date/{product}"}
+            latest = _evergreen_latest(product, releases, today)
+            if latest:
+                upstream_latest[EVERGREEN_UPSTREAM[product]] = latest
     upstream_eol.sort(key=lambda e: (e.get("kind", ""), e.get("label", "")))
     return upstream_eol, upstream_latest, products_ok
+
+
+def _load_or_seed(rules_path: Path) -> Tuple[Optional[dict], bool]:
+    """Returns (rules, existed). Seeds from built-in defaults when missing/incomplete."""
+    if not rules_path.exists():
+        print(f"Creating {rules_path} from built-in defaults + internet feeds ...")
+        return json.loads(json.dumps(DEFAULT_STATIC_RULES)), False
+    try:
+        rules = json.loads(rules_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"ERROR: cannot read {rules_path} ({e}) - rules unchanged")
+        return None, True
+    missing = [k for k in REQUIRED_RULE_SECTIONS if not rules.get(k)]
+    if missing:
+        print(f"Warning: {rules_path} missing sections {missing} - restoring defaults")
+        defaults = json.loads(json.dumps(DEFAULT_STATIC_RULES))
+        for k in missing:
+            rules[k] = defaults[k]
+    return rules, True
+
+
+def _save_rules(rules_path: Path, rules: dict, existed: bool) -> None:
+    """Backup (if existed) + atomic write."""
+    if existed:
+        try:
+            backup = rules_path.with_name(rules_path.stem + ".bak.json")
+            backup.write_text(rules_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: backup failed ({e})")
+    tmp = rules_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(rules_path)
 
 
 def update_rules_from_upstream(rules_path=None):
     """Create (if missing) or refresh vuln_rules.json from standard internet feeds."""
     rules_path = Path(rules_path) if rules_path else resource_path("vuln_rules.json")
-    existed = rules_path.exists()
-    if existed:
-        try:
-            rules = json.loads(rules_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"ERROR: cannot read {rules_path} ({e}) - rules unchanged")
-            return 1
-        # self-heal incomplete files from built-in defaults instead of refusing
-        missing = [k for k in REQUIRED_RULE_SECTIONS if not rules.get(k)]
-        if missing:
-            print(f"Warning: {rules_path} missing sections {missing} - restoring defaults")
-            defaults = json.loads(json.dumps(DEFAULT_STATIC_RULES))
-            for k in missing:
-                rules[k] = defaults[k]
-    else:
-        print(f"Creating {rules_path} from built-in defaults + internet feeds ...")
-        rules = json.loads(json.dumps(DEFAULT_STATIC_RULES))
+    rules, existed = _load_or_seed(rules_path)
+    if rules is None:
+        return 1
     print("Fetching endoflife.date ...")
     upstream_eol, upstream_latest, products_ok = build_upstream_entries()
     if not products_ok and not upstream_eol:
@@ -352,16 +406,7 @@ def update_rules_from_upstream(rules_path=None):
     src["cisa_kev"] = {"url": KEV_URL, "fetched_at": date.today().isoformat(),
                        "entries": len(kev)}
     rules["sources"] = src
-    # backup (only when file existed) + atomic write (never leave a half-written file)
-    if existed:
-        try:
-            backup = rules_path.with_name(rules_path.stem + ".bak.json")
-            backup.write_text(rules_path.read_text(encoding="utf-8"), encoding="utf-8")
-        except Exception as e:
-            print(f"Warning: backup failed ({e})")
-    tmp = rules_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(rules_path)
+    _save_rules(rules_path, rules, existed)
     n_os = sum(1 for e in upstream_eol if e.get("kind") == "os")
     print(f"Saved {rules_path}: upstream_eol={len(upstream_eol)} (os={n_os}, app={len(upstream_eol)-n_os}) "
           f"upstream_latest={upstream_latest}")
