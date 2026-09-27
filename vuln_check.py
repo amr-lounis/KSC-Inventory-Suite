@@ -172,6 +172,23 @@ def level_of(score):
     return "Safe"
 
 
+def classify_os(os_name):
+    """Windows / Linux / Other from host OS string (self-contained, mirrors json_to_excel)."""
+    s = str(os_name or "").strip().lower()
+    if not s:
+        return "other"
+    if "windows" in s or "microsoft" in s or "win32" in s:
+        return "windows"
+    linux_keywords = (
+        "linux", "ubuntu", "debian", "centos", "rhel", "red hat", "fedora",
+        "suse", "astra", "alt linux", "rosa", "mint", "arch", "gentoo",
+        "oracle linux", "almalinux", "rocky", "kali",
+    )
+    if any(k in s for k in linux_keywords):
+        return "linux"
+    return "other"
+
+
 def _check_eol(norm: str, version: str, rules: dict) -> Tuple[int, List[str], List[str]]:
     """Static + upstream EOL matches. Returns (score, reasons, actions).
 
@@ -502,13 +519,20 @@ def find_eol_hosts(data, rules):
 
 
 def analyze(data, rules, kev=None):
-    """Aggregate software across hosts and assess each (name, version)."""
+    """Aggregate software across hosts and assess each (name, version).
+
+    Each item also carries OS split info:
+    - os: sorted list of OS categories where it was seen (windows/linux/other)
+    - os_counts: {cat: install count}
+    - hosts_by_os: {cat: [sample IPs/names]}
+    """
     kev_index = build_kev_index(kev, rules) if kev else []
     norm_cache = {}
     agg = OrderedDict()
     for h in data.get("hosts", []):
         info = h.get("host", {}) if isinstance(h.get("host"), dict) else {}
         hid = str(info.get("ip") or "").strip().split(",")[0] or (info.get("display_name") or "?")
+        os_cat = classify_os(info.get("os", ""))
         for sw in h.get("software", []):
             if not isinstance(sw, dict):
                 continue
@@ -521,17 +545,24 @@ def analyze(data, rules, kev=None):
             if e is None:
                 e = agg[key] = {"name": name, "version": ver,
                                 "publisher": str(sw.get("publisher") or "").strip(),
-                                "count": 0, "hosts": []}
+                                "count": 0, "hosts": [],
+                                "os_counts": {"windows": 0, "linux": 0, "other": 0},
+                                "hosts_by_os": {"windows": [], "linux": [], "other": []}}
             e["count"] += 1
             if hid not in e["hosts"]:
                 e["hosts"].append(hid)
+            e["os_counts"][os_cat] += 1
+            if hid not in e["hosts_by_os"][os_cat]:
+                e["hosts_by_os"][os_cat].append(hid)
     items = []
     for (nl, ver), e in agg.items():
         r = assess(e["name"], ver, e["publisher"], rules, kev_index)
         nn = norm_cache.get(nl)
         if nn is None:
             nn = norm_cache[nl] = normalize_name(e["name"], rules)
+        os_list = sorted([c for c, n in e["os_counts"].items() if n > 0])
         items.append({**e, "family": family_of(nn, rules),
+                      "os": os_list,
                       "score": r["score"], "level": r["level"],
                       "reasons": r["reasons"], "action": r["action"], "cves": []})
     items.sort(key=lambda x: (-x["score"], -x["count"], x["name"]))
@@ -571,9 +602,21 @@ def write_risk_excel(items, eol_hosts, summary, out):
         x.fill = hdr_fill
         x.alignment = center
         x.border = bd
+    by_os = {"windows": 0, "linux": 0, "other": 0}
+    for it in items:
+        cats = it.get("os")
+        if not cats:  # backward compat: items without OS info count everywhere once
+            by_os["other"] += 1
+            continue
+        for c in cats:
+            if c in by_os:
+                by_os[c] += 1
     rows = [("Generated", datetime.now(timezone.utc).isoformat(timespec="seconds")),
             ("Total hosts", summary["total_hosts"]),
             ("Unique software", summary["unique_software"]),
+            ("Windows software", by_os["windows"]),
+            ("Linux software", by_os["linux"]),
+            ("Other software", by_os["other"]),
             ("Hosts at risk", summary["hosts_at_risk"]),
             ("EOL hosts", summary["eol_hosts"])] + \
         [(f"Items: {lv}", summary["by_level"].get(lv, 0)) for lv in RISK_LEVELS]
@@ -607,17 +650,37 @@ def write_risk_excel(items, eol_hosts, summary, out):
         if rows:
             w.auto_filter.ref = f"A1:{w.cell(row=1, column=len(headers)).column_letter}{len(rows) + 1}"
 
-    risky = [it for it in items if it["score"] >= 4]
-    dump("Critical Actions",
-         ["Software", "Version", "Risk", "Hosts", "Sample IPs", "Fix Action"],
-         [[it["name"], it["version"], it["level"], it["count"], ", ".join(it["hosts"][:5]), it["action"]]
-          for it in risky if it["score"] >= 7],
-         [50, 18, 10, 8, 30, 40])
-    dump("All Findings",
-         ["Software", "Version", "Publisher", "Risk", "Score", "Hosts", "Reasons", "Fix Action"],
-         [[it["name"], it["version"], it["publisher"], it["level"], it["score"], it["count"],
-           " | ".join(it["reasons"] + [c["id"] for c in it["cves"]][:3]), it["action"]] for it in risky],
-         [45, 16, 24, 10, 7, 8, 60, 35])
+    def _os_rows(cat):
+        """All programs seen on this OS (not just risky), with per-OS counts."""
+        out_rows = []
+        for it in items:
+            cats = it.get("os")
+            if cats is not None and cat not in cats:
+                continue
+            by_os_hosts = (it.get("hosts_by_os") or {}).get(cat)
+            if by_os_hosts is None:  # backward compat: no OS info -> total
+                n = it.get("count", 0)
+                sample = ", ".join((it.get("hosts") or [])[:5])
+            else:
+                n = len(by_os_hosts)
+                if not n:
+                    continue
+                sample = ", ".join(by_os_hosts[:5])
+            out_rows.append([
+                it["name"], it["version"], it.get("publisher", ""),
+                it["level"], it["score"], n, sample,
+                " | ".join(list(it.get("reasons") or []) +
+                            [c["id"] for c in (it.get("cves") or [])][:3]),
+                it.get("action", "-"),
+            ])
+        return out_rows
+
+    headers = ["Software", "Version", "Publisher", "Risk", "Score",
+               "Hosts", "Sample IPs", "Reasons", "Fix Action"]
+    widths = [45, 16, 24, 10, 7, 8, 30, 60, 35]
+    dump("Windows Soft", headers, _os_rows("windows"), widths)
+    dump("Linux Soft", headers, _os_rows("linux"), widths)
+    dump("Other Soft", headers, _os_rows("other"), widths)
     dump("EOL Hosts", ["IP", "Hostname", "OS", "Issue"],
          [[h["ip"], h["name"], h["os"], h["label"]] for h in eol_hosts],
          [18, 25, 35, 35])
