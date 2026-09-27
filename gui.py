@@ -236,9 +236,18 @@ class App(tk.Tk):
             try:
                 import io
                 import contextlib
+                import logging
                 buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = target()
+                handler = logging.StreamHandler(buf)
+                handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+                root = logging.getLogger()
+                root.addHandler(handler)
+                try:
+                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                        rc = target()
+                finally:
+                    root.removeHandler(handler)
+                    handler.close()
                 for line in buf.getvalue().splitlines():
                     self.after(0, lambda l=line: self.log(l))
                 self.after(0, lambda: self._on_done(rc))

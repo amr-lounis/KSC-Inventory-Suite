@@ -97,24 +97,49 @@ def _write_software_sheet(ws, uniq, hdr_font, hdr_fill, bd, center, left):
     return r
 
 def _write_hosts_sheet(ws, uniq, hdr_font, hdr_fill, bd, center, left):
-    col = 1
+    """Row-based mapping (Software, Version, Host) to avoid Excel 16384-column limit.
+
+    Old layout used one column per software and broke with thousands of
+    unique products. New layout scales to ~1M rows.
+    """
+    headers = ["Software Name", "Version", "Host (IP/name)"]
+    ws.append(headers)
+    for c in range(1, 4):
+        x = ws.cell(row=1, column=c)
+        x.font = hdr_font
+        x.fill = hdr_fill
+        x.alignment = center
+        x.border = bd
+    r = 2
     for v in uniq.values():
-        hdr = f"{v['name']}"
-        if v["version"]:
-            hdr += f" [{v['version']}]"
-        if len(hdr) > 250:
-            hdr = hdr[:250] + "..."
-        c = ws.cell(row=1, column=col, value=hdr); c.font = hdr_font; c.fill = hdr_fill; c.alignment = center; c.border = bd
-        for idx, h in enumerate(v["hosts"], start=2):
-            x = ws.cell(row=idx, column=col, value=h); x.alignment = left; x.border = bd
-        try:
-            ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 22
-        except Exception:
-            pass
-        col += 1
-    if uniq:
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = f"A1:{ws.cell(row=1, column=len(uniq)).column_letter}1"
+        name = v["name"]
+        ver = v.get("version", "")
+        hosts = v.get("hosts", [])
+        if not hosts:
+            ws.cell(row=r, column=1, value=name).alignment = left
+            ws.cell(row=r, column=2, value=ver).alignment = center
+            ws.cell(row=r, column=3, value="").alignment = left
+            for col in range(1, 4):
+                ws.cell(row=r, column=col).border = bd
+            r += 1
+            continue
+        for h in hosts:
+            ws.cell(row=r, column=1, value=name).alignment = left
+            ws.cell(row=r, column=2, value=ver).alignment = center
+            ws.cell(row=r, column=3, value=h).alignment = left
+            for col in range(1, 4):
+                ws.cell(row=r, column=col).border = bd
+            r += 1
+            if r > 1048575:  # Excel row limit guard
+                break
+        if r > 1048575:
+            break
+    ws.column_dimensions["A"].width = 55
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 30
+    ws.freeze_panes = "A2"
+    if r > 2:
+        ws.auto_filter.ref = f"A1:C{r-1}"
 
 def write_excel(split_or_uniq, out, host_counts=None):
     """يكتب ملف Excel مقسّماً حسب نظام التشغيل: Windows / Linux / Other.

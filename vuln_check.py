@@ -86,11 +86,6 @@ def split_tokens_list(s, min_len=3, generic=()):
     return [t for t in _TOK_RE.split(s) if len(t) >= min_len and t not in generic]
 
 
-def split_tokens_list(s, min_len=3, generic=()):
-    """Ordered variant (for top-N slicing)."""
-    return [t for t in _TOK_RE.split(s) if len(t) >= min_len and t not in generic]
-
-
 def normalize_name(name, rules=None):
     s = strip_accents(str(name or "").lower())
     s = s.replace("�", "").replace("\x00", " ")
@@ -121,10 +116,11 @@ def parse_version_cached(s):
 
 
 def cmp_versions(a, b):
-    n = max(len(a), len(b))
-    a += (0,) * (n - len(a))
-    b += (0,) * (n - len(b))
-    return (a > b) - (a < b)
+    la, lb = tuple(a or ()), tuple(b or ())
+    n = max(len(la), len(lb))
+    la += (0,) * (n - len(la))
+    lb += (0,) * (n - len(lb))
+    return (la > lb) - (la < lb)
 
 
 def entry_matches(norm, entry):
@@ -176,13 +172,21 @@ def level_of(score):
     return "Safe"
 
 
-def _check_eol(norm: str, rules: dict) -> Tuple[int, List[str], List[str]]:
-    """Static + upstream EOL matches. Returns (score, reasons, actions)."""
+def _check_eol(norm: str, version: str, rules: dict) -> Tuple[int, List[str], List[str]]:
+    """Static + upstream EOL matches. Returns (score, reasons, actions).
+
+    Matches against 'name + version' so entries like
+    {'match_all': ['chrome', '100']} work even when DisplayName
+    ('Google Chrome') does not contain the version number.
+    """
     score, reasons, actions = 0, [], []
+    ver_norm = strip_accents(str(version or "").lower())
+    ver_norm = _WS_RE.sub(" ", ver_norm).strip()
+    combined = f"{norm} {ver_norm}".strip()
     for item in (rules.get("eol_products") or []) + (rules.get("upstream_eol") or []):
         if item.get("kind", "app") != "app":
             continue
-        if entry_matches(norm, item):
+        if entry_matches(norm, item) or entry_matches(combined, item):
             score = max(score, int(item.get("score", 9)))
             reasons.append(item.get("label", item.get("match", "?")))
             if item.get("action"):
@@ -233,12 +237,20 @@ def _check_freshness(fam: Optional[str], version: str,
                      rules: dict) -> Tuple[int, List[str], List[str]]:
     """endoflife.date evergreen families vs latest known major.
 
-    Edge shares Chromium majors with Chrome, so it reuses the chrome entry.
+    Edge/Opera share Chromium majors with Chrome, so they reuse the chrome entry.
     """
     score, reasons, actions = 0, [], []
     up_latest = rules.get("upstream_latest") or {}
-    fam_key = "google chrome" if fam == "microsoft edge" else fam
-    if not (fam_key in up_latest and version and str(version).strip()):
+    if not (version and str(version).strip()):
+        return score, reasons, actions
+    # Prefer direct entry, fall back to Chrome majors for Chromium-based browsers.
+    candidates = []
+    if fam:
+        candidates.append(fam)
+    if fam in ("microsoft edge", "opera") and "google chrome" not in candidates:
+        candidates.append("google chrome")
+    fam_key = next((c for c in candidates if c in up_latest), None)
+    if not fam_key:
         return score, reasons, actions
     try:
         latest_major = int(up_latest[fam_key].get("major", 0))
@@ -298,7 +310,7 @@ def assess(name: str, version: str, publisher: str = "",
     ver = str(version or "").strip()
 
     checks = [
-        _check_eol(norm, rules),
+        _check_eol(norm, ver, rules),
         _check_min_version(norm, fam, ver, name, rules),
         _check_freshness(fam, ver, rules),
     ]
@@ -317,6 +329,11 @@ def assess(name: str, version: str, publisher: str = "",
         actions.extend(acts)
 
     if not reasons:
+        if not ver:
+            # Missing version must not be reported as Safe (false negative).
+            return {"score": 4, "level": "Medium",
+                    "reasons": ["Version missing - manual review required"],
+                    "action": "Verify installed version manually"}
         return {"score": 0, "level": "Safe", "reasons": [], "action": "-"}
     if not actions:
         actions.append("Update to a supported version")

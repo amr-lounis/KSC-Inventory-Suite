@@ -15,6 +15,7 @@ only the upstream sections (upstream_eol / upstream_latest / sources)
 and keeps user customizations untouched. Stdlib only.
 """
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -111,7 +112,9 @@ EOL_UPSTREAM_PRODUCTS = {
     "oracle-jdk": ("app", "java", False),
 }
 # endoflife.date product -> our family key (true evergreen, single version line)
-EVERGREEN_UPSTREAM = {"chrome": "google chrome", "firefox": "mozilla firefox"}
+# edge is Chromium-based: fetched directly when available, otherwise
+# vuln_check falls back to chrome majors for microsoft edge / opera.
+EVERGREEN_UPSTREAM = {"chrome": "google chrome", "edge": "microsoft edge", "firefox": "mozilla firefox"}
 
 _VERSION_RE = re.compile(r"(\d+(?:\.\d+)*)")
 
@@ -124,8 +127,25 @@ def _clean_version(raw) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _github_headers():
+    """GitHub API headers; uses GITHUB_TOKEN env when set to avoid 60 req/hour limit."""
+    h = dict(UA)
+    h["Accept"] = "application/vnd.github+json"
+    tok = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
 def _provider_github(repo: str, timeout=20):
-    d = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest", timeout=timeout)
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/releases/latest", headers=_github_headers())
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        # Respect rate-limit headers: fail fast with a clear message.
+        remaining = r.headers.get("X-RateLimit-Remaining")
+        if remaining is not None and str(remaining).strip() == "0":
+            raise ValueError("GitHub rate limit exceeded (set GITHUB_TOKEN)")
+        d = json.loads(r.read().decode("utf-8"))
     if d.get("prerelease"):
         raise ValueError("latest is a prerelease")
     v = _clean_version(d.get("tag_name") or d.get("name"))
@@ -184,8 +204,8 @@ def _provider_endoflife_min(product: str, lts_only=False, timeout=30):
 
 
 # our family -> (fetch callable, fix action). All live; failures skip the family.
-# NOTE: browsers (chrome/firefox/edge) are intentionally NOT here: chrome/firefox
-# use evergreen freshness vs latest major, and edge reuses Chromium (chrome) majors.
+# NOTE: browsers (chrome/firefox/edge/opera) are intentionally NOT here: they
+# use evergreen freshness vs latest major (edge/opera fall back to Chromium majors).
 # A min==latest check would score even a days-old browser as High (floor 8).
 VERSION_PROVIDERS = {
     "vlc media player": (lambda: _provider_videolan(), "Update VLC"),

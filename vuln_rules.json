@@ -1560,6 +1560,18 @@
     },
     {
       "match_all": [
+        "chrome",
+        "153"
+      ],
+      "kind": "app",
+      "score": 9,
+      "label": "153 (EOL 2026-09-22, endoflife.date)",
+      "eol": "2026-09-22",
+      "product": "chrome",
+      "action": "Upgrade to a supported version"
+    },
+    {
+      "match_all": [
         "firefox",
         "154"
       ],
@@ -4522,19 +4534,19 @@
   ],
   "upstream_latest": {
     "google chrome": {
-      "major": 153,
-      "checked": "2026-09-20",
+      "major": 154,
+      "checked": "2026-09-27",
       "source": "endoflife.date/chrome"
     },
     "mozilla firefox": {
       "major": 156,
-      "checked": "2026-09-20",
+      "checked": "2026-09-27",
       "source": "endoflife.date/firefox"
     }
   },
   "min_safe_versions": {
     "notepad++": {
-      "min": "8.9.8",
+      "min": "8.9.8.1",
       "action": "Update Notepad++",
       "source": "internet (vuln_update)"
     },
@@ -4559,7 +4571,7 @@
   "sources": {
     "endoflife_date": {
       "url": "https://endoflife.date/api",
-      "fetched_at": "2026-09-20",
+      "fetched_at": "2026-09-27",
       "products": [
         "almalinux",
         "centos",
@@ -4578,12 +4590,12 @@
         "windows",
         "windows-server"
       ],
-      "entries": 369
+      "entries": 370
     },
     "cisa_kev": {
       "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-      "fetched_at": "2026-09-20",
-      "entries": 1716
+      "fetched_at": "2026-09-27",
+      "entries": 1726
     }
   }
 }

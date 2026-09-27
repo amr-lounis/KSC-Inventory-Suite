@@ -41,7 +41,14 @@ def load_settings(path=SETTINGS_PATH):
 
 def save_settings(settings, path=SETTINGS_PATH):
     try:
-        Path(path).write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+        p = Path(path)
+        p.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            # settings.json contains a plaintext password: restrict permissions when possible.
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+        log.warning("settings.json contains a plaintext password - restrict file access")
         log.info("Settings saved to %s", path)
     except Exception as e:
         log.error("Failed to save settings %s: %s", path, e)
@@ -389,16 +396,27 @@ def main(argv=None):
         dn=str(info.get("KLHST_WKS_DN") or "").strip()
         fqdn=str(info.get("KLHST_WKS_FQDN") or "").strip()
         display=dn or fqdn or host_id or "unknown"
-        pro,pat=get_inventory(host_id) if host_id else ([],[])
+        # Prefer hostname (historical behavior) but fall back to instance_id
+        # when hostname yields nothing (duplicates/empty).
+        pro, pat = ([], [])
+        if host_id:
+            pro, pat = get_inventory(host_id)
+        if not pro and instance_id and instance_id != host_id:
+            alt_pro, alt_pat = get_inventory(instance_id)
+            if alt_pro or alt_pat:
+                pro, pat = alt_pro, alt_pat
         if a.no_patches: pat=[]
         out.append({"host":{"display_name":display,"dn":dn,"fqdn":fqdn,"id":host_id,"instance_id":instance_id,"ip":ip_str(info.get("KLHST_WKS_IP")),"os":str(info.get("KLHST_WKS_OS_NAME") or ""),"nag_version":str(info.get("KLHST_WKS_NAG_VERSION") or ""),"last_visible":ksc_dt(info.get("KLHST_WKS_LAST_VISIBLE"))},"software":pro,"patches":pat,"summary":{"total_products":len(pro),"total_patches":len(pat)}})
-        log.info(" -> %s (%s) products=%s patches=%s", display, host_id[:8], len(pro), len(pat))
+        log.info(" -> %s (%s) products=%s patches=%s", display, (host_id or "?")[:8], len(pro), len(pat))
     data={"generated_at":datetime.now(timezone.utc).isoformat(),"ksc_server":KSC_SERVER,"total_hosts":len(out),"hosts":out}
     default_fn = get_out_dir() / f"kaspersky_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     fn = Path(a.output) if a.output else default_fn
-    # if output is relative, make it relative to out dir
+    # if output is relative, make it relative to out dir (avoid out/out duplication)
     if not fn.is_absolute():
-        fn = get_out_dir() / fn
+        if fn.parts and fn.parts[0].lower() == "out":
+            fn = get_app_dir() / fn
+        else:
+            fn = get_out_dir() / fn
     fn.parent.mkdir(parents=True, exist_ok=True)
     with open(fn,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
     log.info("Saved %s hosts=%s", fn, len(out))
