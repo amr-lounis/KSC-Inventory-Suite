@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Offline-first vulnerability triage for Kaspersky inventory JSON.
 
-Stdlib only. Usage:
+Self-contained (stdlib only, no imports from other project scripts).
+Usage:
     py vuln_check.py kaspersky_inventory_*.json [--online] [--top N] [-o out.json] [--excel]
-    py vuln_check.py --update-rules   # refresh vuln_rules.json via vuln_update.py
-                                      # (endoflife.date API + CISA KEV, needs internet)
-Reads vuln_rules.json next to the script/exe.
+Rules come from vuln_rules.json (built by vuln_update.py); paths from gui.py/CLI.
 """
 import json
 import re
@@ -16,21 +15,46 @@ import urllib.request
 import urllib.parse
 from collections import OrderedDict
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from vuln_update import (  # update engine lives in its own module
-    get_app_dir, get_out_dir, resource_path, cache_path, load_kev_cache, fetch_kev)
-
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 NVD_DELAY = 7  # seconds between NVD calls without API key
 
-# Score thresholds (single source of truth for level_of + RISK_COLORS)
+# Score thresholds (single source of truth for level_of + excel fills)
 RISK_LEVELS = ("Critical", "High", "Medium", "Low", "Safe")
 RISK_MIN_SCORE = {"Critical": 9, "High": 7, "Medium": 4, "Low": 1, "Safe": 0}
 RISK_COLORS = {"Critical": "C00000", "High": "ED7D31", "Medium": "FFC000",
                "Low": "FFF2CC", "Safe": "E2EFDA"}
 EVERGREEN_BROWSERS = ("google chrome", "microsoft edge", "mozilla firefox", "opera")
+
+
+def get_app_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+def get_out_dir():
+    d = get_app_dir() / "out"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def resource_path(name):
+    p = get_app_dir() / name
+    if p.exists():
+        return p
+    meipas = getattr(sys, "_MEIPASS", None)
+    if meipas and (Path(meipas) / name).exists():
+        return Path(meipas) / name
+    return p
+
+
+def cache_path(name):
+    return get_out_dir() / name
 
 
 def load_rules(path=None):
@@ -42,17 +66,29 @@ def load_rules(path=None):
         return {}
 
 
-def strip_accents(s):
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-
-
 _WS_RE = re.compile(r"\s+")
 _TOK_RE = re.compile(r"[^a-z0-9]+")
 _NUM_RE = re.compile(r"\d+")
 
+_VER_CACHE: Dict[str, tuple] = {}
+
+
+def strip_accents(s):
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
 
 def split_tokens(s, min_len=5, generic=()):
     return {t for t in _TOK_RE.split(s) if len(t) >= min_len and t not in generic}
+
+
+def split_tokens_list(s, min_len=3, generic=()):
+    """Ordered variant (for top-N slicing)."""
+    return [t for t in _TOK_RE.split(s) if len(t) >= min_len and t not in generic]
+
+
+def split_tokens_list(s, min_len=3, generic=()):
+    """Ordered variant (for top-N slicing)."""
+    return [t for t in _TOK_RE.split(s) if len(t) >= min_len and t not in generic]
 
 
 def normalize_name(name, rules=None):
@@ -67,25 +103,12 @@ def normalize_name(name, rules=None):
     return s
 
 
-def family_of(norm_name, rules):
-    for pat, fam in (rules.get("family_patterns") or []):
-        if pat in norm_name:
-            return fam
-    return None
-
-
-def is_noise(norm_name, rules):
-    return any(p in norm_name for p in (rules.get("noise_patterns") or []))
-
-
 def parse_version(s):
     parts = _NUM_RE.findall(str(s or ""))
     if not parts:
         return ()
     return tuple(int(x) for x in parts[:6])
 
-
-_VER_CACHE = {}
 
 def parse_version_cached(s):
     key = str(s or "")
@@ -104,13 +127,6 @@ def cmp_versions(a, b):
     return (a > b) - (a < b)
 
 
-def level_of(score):
-    for level in RISK_LEVELS:
-        if score >= RISK_MIN_SCORE[level]:
-            return level
-    return "Safe"
-
-
 def entry_matches(norm, entry):
     """Supports {'match': 'substr'} and {'match_all': ['t1','t2',...]} (all tokens)."""
     m = entry.get("match")
@@ -120,6 +136,44 @@ def entry_matches(norm, entry):
     if ma and all(t in norm for t in ma):
         return True
     return False
+
+
+@lru_cache(maxsize=8)
+def _compiled_family_patterns(patterns_key: tuple) -> tuple:
+    """Compile family patterns with word-boundary guard (cached).
+
+    Prevents e.g. 'java' matching 'javascript' while still matching
+    'java 8', 'java(tm) 6', 'python3.12' (digit after is fine).
+    """
+    out = []
+    for pat, fam in patterns_key:
+        try:
+            out.append((re.compile(r"\b" + re.escape(pat) + r"(?![a-z])"), fam, None))
+        except re.error:
+            out.append((None, fam, pat))
+    return tuple(out)
+
+
+def family_of(norm_name, rules):
+    key = tuple(tuple(p) for p in (rules.get("family_patterns") or []))
+    for compiled, fam, fallback in _compiled_family_patterns(key):
+        if compiled is not None:
+            if compiled.search(norm_name):
+                return fam
+        elif fallback and fallback in norm_name:
+            return fam
+    return None
+
+
+def is_noise(norm_name, rules):
+    return any(p in norm_name for p in (rules.get("noise_patterns") or []))
+
+
+def level_of(score):
+    for level in RISK_LEVELS:
+        if score >= RISK_MIN_SCORE[level]:
+            return level
+    return "Safe"
 
 
 def _check_eol(norm: str, rules: dict) -> Tuple[int, List[str], List[str]]:
@@ -177,13 +231,17 @@ def _check_min_version(norm: str, fam: Optional[str], version: str, name: str,
 
 def _check_freshness(fam: Optional[str], version: str,
                      rules: dict) -> Tuple[int, List[str], List[str]]:
-    """endoflife.date evergreen families vs latest known major."""
+    """endoflife.date evergreen families vs latest known major.
+
+    Edge shares Chromium majors with Chrome, so it reuses the chrome entry.
+    """
     score, reasons, actions = 0, [], []
     up_latest = rules.get("upstream_latest") or {}
-    if not (fam in up_latest and version and str(version).strip()):
+    fam_key = "google chrome" if fam == "microsoft edge" else fam
+    if not (fam_key in up_latest and version and str(version).strip()):
         return score, reasons, actions
     try:
-        latest_major = int(up_latest[fam].get("major", 0))
+        latest_major = int(up_latest[fam_key].get("major", 0))
     except (TypeError, ValueError):
         latest_major = 0
     cur = parse_version_cached(version)
@@ -266,18 +324,57 @@ def assess(name: str, version: str, publisher: str = "",
             "reasons": reasons, "action": "; ".join(dict.fromkeys(actions))}
 
 
+def load_kev_cache():
+    for p in (cache_path("kev_cache.json"), get_app_dir() / "kev_cache.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            return d.get("vulnerabilities", d if isinstance(d, list) else [])
+        except Exception:
+            continue
+    return []
+
+
+def fetch_kev(timeout=30):
+    try:
+        req = urllib.request.Request(KEV_URL, headers={"User-Agent": "ksc-inventory/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        vulns = d.get("vulnerabilities", [])
+        cache_path("kev_cache.json").write_text(json.dumps(
+            {"fetched_at": datetime.now(timezone.utc).isoformat(), "count": len(vulns),
+             "vulnerabilities": vulns}, ensure_ascii=False), encoding="utf-8")
+        print(f"KEV cache updated: {len(vulns)} entries")
+        return vulns
+    except Exception as e:
+        print(f"KEV download failed ({e}) - using cache")
+        return load_kev_cache()
+
+
 def build_kev_index(kev_list, rules=None):
-    """Precompute normalized KEV data once (was re-normalized per software item)."""
+    """Precompute normalized KEV data once (was re-normalized per software item).
+
+    Skips vendor-only labels (e.g. product == "Microsoft") that would otherwise
+    match every product of that vendor with an unrelated CVE.
+    """
     generic = set((rules or {}).get("generic_tokens") or ())
     index = []
     for entry in kev_list or []:
         prod = normalize_name(entry.get("product", ""))
         if not prod:
             continue
+        if _is_vendor_only_label(prod, generic):
+            continue
         vend = normalize_name(entry.get("vendorProject", ""))
-        overlap = {t for t in _TOK_RE.split(prod) if len(t) >= 5 and t not in generic}
+        overlap = split_tokens(prod, generic=generic)
         index.append((entry, prod, vend, overlap))
     return index
+
+
+def _is_vendor_only_label(prod: str, generic: set) -> bool:
+    """True for labels like 'Microsoft' that would match every vendor product."""
+    parts = [t for t in prod.split() if t]
+    return bool(parts) and all(t in generic or len(t) < 3 for t in parts) \
+        and not any(c.isdigit() for c in prod)
 
 
 def match_kev_first(norm_name, pub_norm, tokens, kev_index):
@@ -337,7 +434,7 @@ def enrich_nvd(items, rules, top=30, cache_file=None, api_key=None):
             continue
         try:
             data = nvd_search(q, api_key=api_key)
-            toks = [t for t in _TOK_RE.split(normalize_name(q)) if len(t) >= 3 and t not in generic]
+            toks = split_tokens_list(normalize_name(q), generic=generic)
             found = []
             for v in (data.get("vulnerabilities") or [])[:20]:
                 cve = v.get("cve", {})
@@ -367,11 +464,6 @@ def enrich_nvd(items, rules, top=30, cache_file=None, api_key=None):
         print(f"Cannot save NVD cache: {e}")
     return items
 
-
-def update_rules_from_upstream(rules_path=None):
-    """Create (if missing) or refresh vuln_rules.json - delegated to vuln_update.py."""
-    from vuln_update import update_rules_from_upstream as _update
-    return _update(rules_path)
 
 def find_eol_hosts(data, rules):
     """Hosts whose OS matches EOL list (or empty OS). Returns list of dicts."""
@@ -467,7 +559,7 @@ def write_risk_excel(items, eol_hosts, summary, out):
             ("Unique software", summary["unique_software"]),
             ("Hosts at risk", summary["hosts_at_risk"]),
             ("EOL hosts", summary["eol_hosts"])] + \
-        [(f"Items: {lv}", summary["by_level"].get(lv, 0)) for lv in ("Critical", "High", "Medium", "Low", "Safe")]
+        [(f"Items: {lv}", summary["by_level"].get(lv, 0)) for lv in RISK_LEVELS]
     for r, (k, v) in enumerate(rows, start=2):
         ws.cell(row=r, column=1, value=k).alignment = left
         ws.cell(row=r, column=2, value=v).alignment = center
@@ -516,7 +608,6 @@ def write_risk_excel(items, eol_hosts, summary, out):
 
 
 USAGE = """Usage: py vuln_check.py <input.json> [-o report.json] [--excel] [--online]
-       py vuln_check.py --update-rules
 
 Analyze one Kaspersky inventory JSON for vulnerable/EOL software.
 
@@ -524,6 +615,7 @@ Examples:
   py vuln_check.py out\\kaspersky_inventory_20260916_141859.json --excel
   py vuln_check.py out\\kaspersky_inventory_20260916_141859.json -o out\\my_report.json --online
 
+Rules come from vuln_rules.json (built by vuln_update.py).
 Paths can also be driven from gui.py (Vulnerability Report button)."""
 
 def main(argv=None):
@@ -535,12 +627,8 @@ def main(argv=None):
     ap.add_argument("--online", action="store_true", help="fetch KEV + NVD enrichment (needs internet)")
     ap.add_argument("--top", type=int, default=30, help="NVD-enriched items (default 30)")
     ap.add_argument("--rules", help="path to vuln_rules.json")
-    ap.add_argument("--update-rules", action="store_true",
-                    help="download endoflife.date + CISA KEV and refresh upstream sections of vuln_rules.json")
     a = ap.parse_args(argv)
 
-    if a.update_rules:
-        return update_rules_from_upstream(a.rules)
     if not a.input:
         print(USAGE)
         return 1

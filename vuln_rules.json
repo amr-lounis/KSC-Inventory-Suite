@@ -1,213 +1,5 @@
 {
-  "_comment": "Vulnerability rules for vuln_check.py - editable without touching code. All matching is case-insensitive substring on the normalized software/OS name.",
-  "eol_os": [
-    {
-      "match": "windows xp",
-      "label": "Windows XP (EOL 2014)",
-      "score": 10
-    },
-    {
-      "match": "windows vista",
-      "label": "Windows Vista (EOL 2017)",
-      "score": 10
-    },
-    {
-      "match": "windows 7",
-      "label": "Windows 7 (EOL 2020)",
-      "score": 10
-    },
-    {
-      "match": "windows 8",
-      "label": "Windows 8/8.1 (EOL 2016/2023)",
-      "score": 10
-    },
-    {
-      "match": "windows 8.1",
-      "label": "Windows 8.1 (EOL 2023)",
-      "score": 10
-    },
-    {
-      "match": "server 2003",
-      "label": "Windows Server 2003 (EOL 2015)",
-      "score": 10
-    },
-    {
-      "match": "server 2008",
-      "label": "Windows Server 2008/R2 (EOL 2020)",
-      "score": 10
-    },
-    {
-      "match": "server 2012",
-      "label": "Windows Server 2012/R2 (EOL 2023)",
-      "score": 9
-    }
-  ],
-  "eol_products": [
-    {
-      "match": "office professional plus 2007",
-      "label": "Office 2007 (EOL 2017)",
-      "score": 9,
-      "action": "Uninstall / Upgrade to a supported Office"
-    },
-    {
-      "match": "office standard 2007",
-      "label": "Office 2007 (EOL 2017)",
-      "score": 9,
-      "action": "Uninstall / Upgrade to a supported Office"
-    },
-    {
-      "match": "office professional plus 2010",
-      "label": "Office 2010 (EOL 2020)",
-      "score": 9,
-      "action": "Uninstall / Upgrade to a supported Office"
-    },
-    {
-      "match": "office standard 2010",
-      "label": "Office 2010 (EOL 2020)",
-      "score": 9,
-      "action": "Uninstall / Upgrade to a supported Office"
-    },
-    {
-      "match": "office professional plus 2013",
-      "label": "Office 2013 (EOL 2023)",
-      "score": 8,
-      "action": "Upgrade to a supported Office"
-    },
-    {
-      "match": "java 6",
-      "label": "Java 6 (EOL 2013)",
-      "score": 9,
-      "action": "Uninstall / Upgrade Java"
-    },
-    {
-      "match": "java 7",
-      "label": "Java 7 (EOL 2015)",
-      "score": 9,
-      "action": "Uninstall / Upgrade Java"
-    },
-    {
-      "match": "java(tm) 6",
-      "label": "Java 6 (EOL 2013)",
-      "score": 9,
-      "action": "Uninstall / Upgrade Java"
-    },
-    {
-      "match": "visual c++ 2008",
-      "label": "VC++ 2008 (EOL, DLL-hijack history)",
-      "score": 7,
-      "action": "Uninstall if unused"
-    },
-    {
-      "match": "visual c++ 2010",
-      "label": "VC++ 2010 (EOL 2020)",
-      "score": 7,
-      "action": "Uninstall if unused"
-    },
-    {
-      "match": "visual c++ 2012",
-      "label": "VC++ 2012 (support ended 2023)",
-      "score": 5,
-      "action": "Uninstall if unused"
-    },
-    {
-      "match": "visual c++ 2013",
-      "label": "VC++ 2013 (support ended 2024)",
-      "score": 5,
-      "action": "Uninstall if unused"
-    },
-    {
-      "match": "adobe flash",
-      "label": "Flash Player (EOL 2020)",
-      "score": 10,
-      "action": "Uninstall immediately"
-    },
-    {
-      "match": "shockwave",
-      "label": "Shockwave (EOL 2019)",
-      "score": 9,
-      "action": "Uninstall immediately"
-    },
-    {
-      "match": "quicktime",
-      "label": "QuickTime for Windows (EOL 2016)",
-      "score": 9,
-      "action": "Uninstall immediately"
-    }
-  ],
-  "min_safe_versions": {
-    "google chrome": {
-      "min": "152.0.0.0",
-      "action": "Update browser"
-    },
-    "microsoft edge": {
-      "min": "152.0.0.0",
-      "action": "Update browser"
-    },
-    "mozilla firefox": {
-      "min": "154.0.0.0",
-      "action": "Update browser"
-    },
-    "opera": {
-      "min": "117.0.0.0",
-      "action": "Update browser"
-    },
-    "adobe acrobat": {
-      "min": "25.001.0.0",
-      "action": "Update via Adobe updater"
-    },
-    "adobe reader": {
-      "min": "25.001.0.0",
-      "action": "Update via Adobe updater"
-    },
-    "java": {
-      "min": "8.0.441.0",
-      "action": "Update Java / remove if unused"
-    },
-    "vlc media player": {
-      "min": "3.0.21.0",
-      "action": "Update VLC"
-    },
-    "7-zip": {
-      "min": "24.9.0.0",
-      "action": "Update 7-Zip (known MotW CVEs in old builds)"
-    },
-    "winrar": {
-      "min": "7.1.0.0",
-      "action": "Update WinRAR (CVE-2023-38831 in older builds)"
-    },
-    "python": {
-      "min": "3.12.0.0",
-      "action": "Upgrade Python (3.8 and older are EOL)"
-    },
-    "kaspersky endpoint security": {
-      "min": "12.7.0.0",
-      "action": "Update KES via KSC task"
-    },
-    "kaspersky security center": {
-      "min": "14.0.0.0",
-      "action": "Update KSC agent via KSC task"
-    },
-    "ocs inventory": {
-      "min": "2.9.0.0",
-      "action": "Update OCS agent"
-    },
-    "vmware tools": {
-      "min": "12.3.0.0",
-      "action": "Update VMware Tools"
-    },
-    "notepad++": {
-      "min": "8.6.0.0",
-      "action": "Update Notepad++"
-    },
-    "teamviewer": {
-      "min": "15.50.0.0",
-      "action": "Update TeamViewer / restrict access"
-    },
-    "anydesk": {
-      "min": "8.1.0.0",
-      "action": "Update AnyDesk / restrict access"
-    }
-  },
+  "_comment": "vuln_rules.json is GENERATED from the internet (endoflife.date + CISA KEV + vendor version APIs) by vuln_update.py. Only the *-dictionaries below (aliases/family/noise/generic) are local normalization knowledge; all scores, EOL dates and versions come from online feeds.",
   "family_patterns": [
     [
       "google chrome",
@@ -2609,18 +2401,6 @@
     {
       "match_all": [
         "python",
-        "3.1"
-      ],
-      "kind": "app",
-      "score": 9,
-      "label": "3.1 (EOL 2012-04-09, endoflife.date)",
-      "eol": "2012-04-09",
-      "product": "python",
-      "action": "Upgrade to a supported version"
-    },
-    {
-      "match_all": [
-        "python",
         "3.2"
       ],
       "kind": "app",
@@ -4752,6 +4532,30 @@
       "source": "endoflife.date/firefox"
     }
   },
+  "min_safe_versions": {
+    "notepad++": {
+      "min": "8.9.8",
+      "action": "Update Notepad++",
+      "source": "internet (vuln_update)"
+    },
+    "ocs inventory": {
+      "min": "2.11.0.1",
+      "action": "Update OCS agent",
+      "source": "internet (vuln_update)"
+    },
+    "python": {
+      "min": "3.10.21",
+      "action": "Upgrade Python",
+      "source": "internet (vuln_update)"
+    },
+    "java": {
+      "min": "17.0.20.1",
+      "action": "Update Java / remove if unused",
+      "source": "internet (vuln_update)"
+    }
+  },
+  "eol_os": [],
+  "eol_products": [],
   "sources": {
     "endoflife_date": {
       "url": "https://endoflife.date/api",
@@ -4774,7 +4578,7 @@
         "windows",
         "windows-server"
       ],
-      "entries": 370
+      "entries": 369
     },
     "cisa_kev": {
       "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",

@@ -322,8 +322,8 @@ class App(tk.Tk):
             return
 
         def target():
-            import vuln_check as vc
-            rc = vc.main(["--update-rules"])
+            import vuln_update as vu
+            rc = vu.main([])
             if rc == 0:
                 self.after(0, lambda: self.status.set("Vuln rules updated"))
                 self.after(0, lambda: messagebox.showinfo("Done", "vuln_rules.json updated from the internet"))

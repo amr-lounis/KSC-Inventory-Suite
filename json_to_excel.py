@@ -11,7 +11,6 @@ def get_app_dir():
     return Path(__file__).parent
 
 def get_out_dir():
-    # كل الملفات الناتجة داخل مجلد out
     d = get_app_dir() / "out"
     d.mkdir(parents=True, exist_ok=True)
     return d
