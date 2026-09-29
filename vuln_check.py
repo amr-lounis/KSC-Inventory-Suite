@@ -580,6 +580,87 @@ def summarize(items, eol_hosts, total_hosts):
             "eol_hosts": len(eol_hosts), "hosts_at_risk": hosts_at_risk}
 
 
+def _merge_by_software(items, cat):
+    """Group items of one OS by software name (case-insensitive).
+
+    One row per Software; Version cell holds all distinct versions sorted.
+    Score = worst (max) across versions; hosts/reasons/actions = union.
+    """
+    groups = OrderedDict()
+    for it in items:
+        cats = it.get("os")
+        if cats is not None and cat not in cats:
+            continue
+        key = str(it.get("name") or "").strip().lower()
+        if not key:
+            continue
+        by_os_hosts = (it.get("hosts_by_os") or {}).get(cat)
+        if by_os_hosts is None:  # backward compat: items without OS info
+            hosts = list(it.get("hosts") or [])
+        else:
+            hosts = list(by_os_hosts)
+            if not hosts:
+                continue
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {
+                "name": str(it.get("name") or "").strip(),
+                "versions": [], "versions_set": set(),
+                "publishers": [], "pub_set": set(),
+                "score": 0, "hosts": [], "hosts_set": set(),
+                "reasons": [], "reasons_set": set(),
+                "actions": [], "actions_set": set(),
+                "cves": [], "cves_set": set(),
+            }
+        ver = str(it.get("version") or "").strip()
+        if ver and ver not in g["versions_set"]:
+            g["versions_set"].add(ver)
+            g["versions"].append(ver)
+        pub = str(it.get("publisher") or "").strip()
+        if pub and pub not in g["pub_set"]:
+            g["pub_set"].add(pub)
+            g["publishers"].append(pub)
+        try:
+            sc = int(it.get("score", 0))
+        except (TypeError, ValueError):
+            sc = 0
+        if sc > g["score"]:
+            g["score"] = sc
+        for h in hosts:
+            if h not in g["hosts_set"]:
+                g["hosts_set"].add(h)
+                g["hosts"].append(h)
+        for r in (it.get("reasons") or []):
+            if r not in g["reasons_set"]:
+                g["reasons_set"].add(r)
+                g["reasons"].append(r)
+        act = it.get("action", "-")
+        acts = [act] if isinstance(act, str) else list(act or [])
+        for a in acts:
+            a = (a or "").strip()
+            if a and a != "-" and a not in g["actions_set"]:
+                g["actions_set"].add(a)
+                g["actions"].append(a)
+        for c in (it.get("cves") or []):
+            cid = c.get("id") if isinstance(c, dict) else c
+            if cid and cid not in g["cves_set"]:
+                g["cves_set"].add(cid)
+                g["cves"].append(cid)
+
+    def _vkey(v):
+        t = parse_version_cached(v)
+        if t:
+            return (0, t, "")
+        return (1, (), str(v).lower())
+
+    merged = []
+    for g in groups.values():
+        g["versions"].sort(key=_vkey)
+        merged.append(g)
+    merged.sort(key=lambda g: (-g["score"], -len(g["hosts"]), g["name"].lower()))
+    return merged
+
+
 def write_risk_excel(items, eol_hosts, summary, out):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -602,18 +683,20 @@ def write_risk_excel(items, eol_hosts, summary, out):
         x.fill = hdr_fill
         x.alignment = center
         x.border = bd
-    by_os = {"windows": 0, "linux": 0, "other": 0}
-    for it in items:
-        cats = it.get("os")
-        if not cats:  # backward compat: items without OS info count everywhere once
-            by_os["other"] += 1
-            continue
-        for c in cats:
-            if c in by_os:
-                by_os[c] += 1
+    # Items without OS info (legacy) are shown in every sheet so no data is lost.
+    merged_by_os = {c: _merge_by_software(items, c)
+                    for c in ("windows", "linux", "other")}
+    by_os = {c: len(merged_by_os[c]) for c in merged_by_os}
+    # Unique software names across all OS (same software on several OS counts once)
+    _all_names = set()
+    for c in merged_by_os:
+        for g in merged_by_os[c]:
+            _all_names.add(g["name"].strip().lower())
+    merged_total = len(_all_names)
     rows = [("Generated", datetime.now(timezone.utc).isoformat(timespec="seconds")),
             ("Total hosts", summary["total_hosts"]),
-            ("Unique software", summary["unique_software"]),
+            ("Unique software (name+version)", summary["unique_software"]),
+            ("Unique software names", merged_total),
             ("Windows software", by_os["windows"]),
             ("Linux software", by_os["linux"]),
             ("Other software", by_os["other"]),
@@ -651,33 +734,21 @@ def write_risk_excel(items, eol_hosts, summary, out):
             w.auto_filter.ref = f"A1:{w.cell(row=1, column=len(headers)).column_letter}{len(rows) + 1}"
 
     def _os_rows(cat):
-        """All programs seen on this OS (not just risky), with per-OS counts."""
+        """One row per Software; Version cell holds all distinct versions."""
         out_rows = []
-        for it in items:
-            cats = it.get("os")
-            if cats is not None and cat not in cats:
-                continue
-            by_os_hosts = (it.get("hosts_by_os") or {}).get(cat)
-            if by_os_hosts is None:  # backward compat: no OS info -> total
-                n = it.get("count", 0)
-                sample = ", ".join((it.get("hosts") or [])[:5])
-            else:
-                n = len(by_os_hosts)
-                if not n:
-                    continue
-                sample = ", ".join(by_os_hosts[:5])
+        for g in merged_by_os[cat]:
+            level = level_of(g["score"])
             out_rows.append([
-                it["name"], it["version"], it.get("publisher", ""),
-                it["level"], it["score"], n, sample,
-                " | ".join(list(it.get("reasons") or []) +
-                            [c["id"] for c in (it.get("cves") or [])][:3]),
-                it.get("action", "-"),
+                g["name"], ", ".join(g["versions"]), " / ".join(g["publishers"]),
+                level, g["score"], len(g["hosts"]), ", ".join(g["hosts"][:5]),
+                " | ".join(g["reasons"] + g["cves"][:5]),
+                "; ".join(g["actions"]) or "-",
             ])
         return out_rows
 
     headers = ["Software", "Version", "Publisher", "Risk", "Score",
                "Hosts", "Sample IPs", "Reasons", "Fix Action"]
-    widths = [45, 16, 24, 10, 7, 8, 30, 60, 35]
+    widths = [45, 30, 24, 10, 7, 8, 30, 60, 35]
     dump("Windows Soft", headers, _os_rows("windows"), widths)
     dump("Linux Soft", headers, _os_rows("linux"), widths)
     dump("Other Soft", headers, _os_rows("other"), widths)
