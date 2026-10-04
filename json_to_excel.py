@@ -1,9 +1,66 @@
 #!/usr/bin/env python3
-import json, glob, os, sys
+import json, glob, os, re, sys
 from pathlib import Path
 from collections import OrderedDict
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+_VER_NUM_RE = re.compile(r"\d+")
+
+
+def _version_sort_key(v):
+    parts = _VER_NUM_RE.findall(str(v or ""))
+    if parts:
+        return (0, tuple(int(x) for x in parts[:6]), "")
+    return (1, (), str(v or "").lower())
+
+
+def _merge_uniq_by_name(uniq):
+    """Group (name, version) entries by software name (case-insensitive).
+
+    One row per Software; Version cell holds all distinct versions sorted.
+    Count = total installs across versions; hosts = union preserving order.
+    """
+    groups = OrderedDict()
+    for v in (uniq or {}).values():
+        key = str(v.get("name") or "").strip().lower()
+        if not key:
+            continue
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {
+                "name": str(v.get("name") or "").strip(),
+                "versions": [], "versions_set": set(),
+                "publishers": [], "pub_set": set(),
+                "count": 0, "hosts": [], "hosts_set": set(),
+            }
+        ver = str(v.get("version") or "").strip()
+        if ver and ver not in g["versions_set"]:
+            g["versions_set"].add(ver)
+            g["versions"].append(ver)
+        pub = str(v.get("publisher") or "").strip()
+        if pub and pub not in g["pub_set"]:
+            g["pub_set"].add(pub)
+            g["publishers"].append(pub)
+        try:
+            g["count"] += int(v.get("count", 0))
+        except (TypeError, ValueError):
+            pass
+        for h in (v.get("hosts") or []):
+            if h not in g["hosts_set"]:
+                g["hosts_set"].add(h)
+                g["hosts"].append(h)
+    merged = OrderedDict()
+    for key, g in groups.items():
+        g["versions"].sort(key=_version_sort_key)
+        merged[key] = {
+            "name": g["name"],
+            "version": ", ".join(g["versions"]),
+            "publisher": " / ".join(g["publishers"]),
+            "count": g["count"],
+            "hosts": g["hosts"],
+        }
+    return OrderedDict(sorted(merged.items(), key=lambda kv: kv[0]))
 
 def get_app_dir():
     if getattr(sys, 'frozen', False):
@@ -24,7 +81,7 @@ def find_all(pattern="kaspersky_inventory_*.json"):
 def load_json(p): return json.loads(Path(p).read_text(encoding="utf-8"))
 
 def classify_os(os_name):
-    """Windows / Linux / Other حسب نص حقل os الخاص بالجهاز."""
+    """Windows / Linux / Other from the device os field text."""
     s = str(os_name or "").strip().lower()
     if not s:
         return "other"
@@ -41,14 +98,14 @@ def classify_os(os_name):
 
 
 def dedup_by_os(data):
-    """تجميع البرامج الفريدة لكل نوع نظام تشغيل + عدّ الأجهزة لكل نوع."""
+    """Unique software per OS category + host count per category."""
     split = {"windows": OrderedDict(), "linux": OrderedDict(), "other": OrderedDict()}
     host_counts = {"windows": 0, "linux": 0, "other": 0}
     for h in data.get("hosts", []):
         host_info = h.get("host", {}) if isinstance(h.get("host"), dict) else {}
         os_name = host_info.get("os", "")
         ip_raw = str(host_info.get("ip") or "").strip()
-        # شيتات Hosts تعرض IP بدل اسم الجهاز (مع fallback للاسم عند غياب IP)
+        # Hosts sheets show IP instead of hostname (fallback to name when IP missing)
         fallback = host_info.get("display_name") or host_info.get("dn") or "unknown"
         hid = ip_raw.split(",")[0].strip() if ip_raw else str(fallback).strip()
         if not hid:
@@ -89,7 +146,7 @@ def _write_software_sheet(ws, uniq, hdr_font, hdr_fill, bd, center, left):
         for col in range(1, 5):
             ws.cell(row=r, column=col).border = bd
         r += 1
-    ws.column_dimensions["A"].width = 55; ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["A"].width = 55; ws.column_dimensions["B"].width = 30
     ws.column_dimensions["C"].width = 28; ws.column_dimensions["D"].width = 12
     ws.freeze_panes = "A2"
     if r > 2:
@@ -142,12 +199,12 @@ def _write_hosts_sheet(ws, uniq, hdr_font, hdr_fill, bd, center, left):
         ws.auto_filter.ref = f"A1:C{r-1}"
 
 def write_excel(split_or_uniq, out, host_counts=None):
-    """يكتب ملف Excel مقسّماً حسب نظام التشغيل: Windows / Linux / Other.
+    """Write Excel file split by OS: Windows / Linux / Other.
 
-    يقبل قاموس التقسيم {"windows":..., "linux":..., "other":...}
-    أو (للتوافق القديم) قاموس uniq مدمج فيضعه في شيت واحد.
+    Accepts a split dict {"windows":..., "linux":..., "other":...}
+    or (legacy) a merged uniq dict placed in a single sheet.
     """
-    # توافق قديم: uniq مدمج وليس تقسيماً
+    # legacy: merged uniq, not a split
     if split_or_uniq and all(isinstance(v, dict) and "name" in v for v in split_or_uniq.values()):
         split = {"windows": split_or_uniq, "linux": OrderedDict(), "other": OrderedDict()}
         host_counts = host_counts or {}
@@ -161,6 +218,10 @@ def write_excel(split_or_uniq, out, host_counts=None):
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
+    # Software sheets show one row per Software (versions merged in Version cell).
+    merged = {cat: _merge_uniq_by_name(split.get(cat, OrderedDict()))
+              for cat in ("windows", "linux", "other")}
+
     # Sheet 1: Summary
     ws0 = wb.active; ws0.title = "Summary"
     ws0.append(["OS Type", "Hosts Count", "Unique Software Count"])
@@ -168,10 +229,9 @@ def write_excel(split_or_uniq, out, host_counts=None):
         x = ws0.cell(row=1, column=c); x.font = hdr_font; x.fill = hdr_fill; x.alignment = center; x.border = bd
     r = 2
     for cat, label in (("windows", "Windows"), ("linux", "Linux"), ("other", "Other")):
-        uniq = split.get(cat, OrderedDict())
         ws0.cell(row=r, column=1, value=label).alignment = center
         ws0.cell(row=r, column=2, value=host_counts.get(cat, 0)).alignment = center
-        ws0.cell(row=r, column=3, value=len(uniq)).alignment = center
+        ws0.cell(row=r, column=3, value=len(merged.get(cat, OrderedDict()))).alignment = center
         for col in range(1, 4):
             ws0.cell(row=r, column=col).border = bd
         r += 1
@@ -179,10 +239,10 @@ def write_excel(split_or_uniq, out, host_counts=None):
     ws0.column_dimensions["C"].width = 22
     ws0.freeze_panes = "A2"
 
-    # Sheets 2-4: Software per OS
+    # Sheets 2-4: Software per OS (merged: one row per Software)
     for cat, title in (("windows", "Windows Software"), ("linux", "Linux Software"), ("other", "Other Software")):
         ws = wb.create_sheet(title)
-        _write_software_sheet(ws, split.get(cat, OrderedDict()), hdr_font, hdr_fill, bd, center, left)
+        _write_software_sheet(ws, merged.get(cat, OrderedDict()), hdr_font, hdr_fill, bd, center, left)
 
     # Sheets 5-7: Hosts per Software per OS
     for cat, title in (("windows", "Hosts - Windows"), ("linux", "Hosts - Linux"), ("other", "Hosts - Other")):
@@ -196,8 +256,8 @@ def process_one(inp, out=None):
     data=load_json(inp)
     total=sum(len(h.get("software",[])) for h in data.get("hosts",[]))
     split, host_counts=dedup_by_os(data)
-    nw=len(split["windows"]); nl=len(split["linux"]); no=len(split["other"])
-    print(f"Hosts {len(data.get('hosts',[]))} (W={host_counts['windows']} L={host_counts['linux']} O={host_counts['other']}) total {total} unique W={nw} L={nl} O={no}")
+    mw=len(_merge_uniq_by_name(split["windows"])); ml=len(_merge_uniq_by_name(split["linux"])); mo=len(_merge_uniq_by_name(split["other"]))
+    print(f"Hosts {len(data.get('hosts',[]))} (W={host_counts['windows']} L={host_counts['linux']} O={host_counts['other']}) total {total} unique software W={mw} L={ml} O={mo}")
     if out is None:
         out = get_out_dir() / f"software_inventory_{Path(inp).stem}.xlsx"
     else:

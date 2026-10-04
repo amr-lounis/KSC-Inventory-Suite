@@ -661,7 +661,50 @@ def _merge_by_software(items, cat):
     return merged
 
 
-def write_risk_excel(items, eol_hosts, summary, out):
+def _hosts_critical_by_os(data, items):
+    """One row per host with only Critical/High software, grouped by OS."""
+    lookup = {}
+    for it in items or []:
+        if it.get("level") not in ("Critical", "High"):
+            continue
+        key = (str(it.get("name") or "").strip().lower(),
+               str(it.get("version") or "").strip())
+        # keep worst score on collision
+        prev = lookup.get(key)
+        if prev is None or int(it.get("score", 0)) > int(prev.get("score", 0)):
+            lookup[key] = it
+
+    by_os = {"windows": [], "linux": [], "other": []}
+    for h in (data or {}).get("hosts", []):
+        info = h.get("host", {}) if isinstance(h.get("host"), dict) else {}
+        ip = str(info.get("ip") or "").strip().split(",")[0] \
+            or str(info.get("display_name") or info.get("dn") or "?")
+        hostname = str(info.get("display_name") or info.get("dn") or "?")
+        cat = classify_os(info.get("os", ""))
+        risky = []
+        for sw in h.get("software", []):
+            if not isinstance(sw, dict):
+                continue
+            nm = str(sw.get("name") or "").strip()
+            vr = str(sw.get("version") or "").strip()
+            if not nm:
+                continue
+            it = lookup.get((nm.lower(), vr))
+            if it is not None:
+                risky.append((nm, vr, it))
+        if not risky:
+            continue
+        risky.sort(key=lambda t: (-int(t[2].get("score", 0)), t[0].lower()))
+        sw_list = "\n".join(f"{n} {v} [{r.get('level')}]" for n, v, r in risky)
+        notes = "\n".join(
+            f"{n} {v}: {' | '.join(list(r.get('reasons') or []) + [c.get('id') if isinstance(c, dict) else str(c) for c in (r.get('cves') or [])[:3]])}".strip()
+            for n, v, r in risky)
+        recs = "\n".join(f"{n} {v}: {r.get('action') or '-'}" for n, v, r in risky)
+        by_os.get(cat, by_os["other"]).append([ip, hostname, sw_list, notes, recs])
+    return by_os
+
+
+def write_risk_excel(items, eol_hosts, summary, out, data=None):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     wb = Workbook()
@@ -708,10 +751,45 @@ def write_risk_excel(items, eol_hosts, summary, out):
         ws.cell(row=r, column=2, value=v).alignment = center
         ws.cell(row=r, column=1).border = bd
         ws.cell(row=r, column=2).border = bd
-    ws.column_dimensions["A"].width = 22
-    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 42
+    ws.row_dimensions[1].height = 22
+    ws.freeze_panes = "A2"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    def _est_lines(text, width):
+        """Estimate wrapped line count for a cell given column width."""
+        s = "" if text is None else str(text)
+        if not s:
+            return 1
+        per_line = max(10, int(width * 1.0))
+        total = 0
+        for seg in s.split("\n"):
+            total += max(1, -(-len(seg) // per_line))
+        return max(1, total)
+
+    def _autofit_widths(headers, rows, base, caps, sample=2000):
+        """Widen columns to fit content, within caps."""
+        out_w = list(base)
+        for c in range(len(headers)):
+            mx = len(str(headers[c]))
+            for row in rows[:sample]:
+                v = row[c]
+                if v is None:
+                    continue
+                for seg in str(v).split("\n"):
+                    if len(seg) > mx:
+                        mx = len(seg)
+                    if mx >= caps[c]:
+                        break
+                if mx >= caps[c]:
+                    break
+            out_w[c] = min(caps[c], max(base[c], mx + 2))
+        return out_w
 
     def dump(title, headers, rows, widths):
+        caps = [50, 35, 30, 12, 8, 10, 80, 45]
+        widths = _autofit_widths(headers, rows, widths, caps)
         w = wb.create_sheet(title)
         w.append(headers)
         for c in range(1, len(headers) + 1):
@@ -720,16 +798,21 @@ def write_risk_excel(items, eol_hosts, summary, out):
             x.fill = hdr_fill
             x.alignment = center
             x.border = bd
+        w.row_dimensions[1].height = 22
         for r, row in enumerate(rows, start=2):
+            top = 1
             for c, v in enumerate(row, start=1):
                 cell = w.cell(row=r, column=c, value=v)
                 cell.alignment = center if c in (2, 4, 5) else left
                 cell.border = bd
                 if headers[c - 1] == "Risk" and v in fills:
                     cell.fill = fills[v]
+                top = max(top, _est_lines(v, widths[c - 1]))
+            w.row_dimensions[r].height = min(180, max(15, 15 * top))
         for col, wd in zip("ABCDEFGH", widths):
             w.column_dimensions[col].width = wd
         w.freeze_panes = "A2"
+        w.sheet_properties.pageSetUpPr.fitToPage = True
         if rows:
             w.auto_filter.ref = f"A1:{w.cell(row=1, column=len(headers)).column_letter}{len(rows) + 1}"
 
@@ -740,21 +823,112 @@ def write_risk_excel(items, eol_hosts, summary, out):
             level = level_of(g["score"])
             out_rows.append([
                 g["name"], ", ".join(g["versions"]), " / ".join(g["publishers"]),
-                level, g["score"], len(g["hosts"]), ", ".join(g["hosts"][:5]),
+                level, g["score"], len(g["hosts"]),
                 " | ".join(g["reasons"] + g["cves"][:5]),
                 "; ".join(g["actions"]) or "-",
             ])
         return out_rows
 
     headers = ["Software", "Version", "Publisher", "Risk", "Score",
-               "Hosts", "Sample IPs", "Reasons", "Fix Action"]
-    widths = [45, 30, 24, 10, 7, 8, 30, 60, 35]
+               "Hosts", "Reasons", "Fix Action"]
+    widths = [45, 30, 24, 10, 7, 8, 60, 35]
     dump("Windows Soft", headers, _os_rows("windows"), widths)
     dump("Linux Soft", headers, _os_rows("linux"), widths)
-    dump("Other Soft", headers, _os_rows("other"), widths)
-    dump("EOL Hosts", ["IP", "Hostname", "OS", "Issue"],
-         [[h["ip"], h["name"], h["os"], h["label"]] for h in eol_hosts],
-         [18, 25, 35, 35])
+
+    if data is not None:
+        by_os = _hosts_critical_by_os(data, items)
+        h_headers = ["IP Host", "Host Name", "Critical/High Software", "Note", "Recommendation"]
+        h_widths = [18, 25, 50, 60, 45]
+
+        def dump_hosts(title, rows):
+            rows = sorted(rows, key=lambda r: (-r[2].count("\n"), r[1].lower()))
+            widths = _autofit_widths(h_headers, rows, h_widths, [22, 30, 55, 80, 50])
+            w = wb.create_sheet(title)
+            w.append(h_headers)
+            for c in range(1, len(h_headers) + 1):
+                x = w.cell(row=1, column=c)
+                x.font = hdr_font
+                x.fill = hdr_fill
+                x.alignment = center
+                x.border = bd
+            w.row_dimensions[1].height = 22
+            for r, row in enumerate(rows, start=2):
+                top = 1
+                for c, v in enumerate(row, start=1):
+                    cell = w.cell(row=r, column=c, value=v)
+                    cell.alignment = center if c in (1, 2) else left
+                    cell.border = bd
+                    top = max(top, _est_lines(v, widths[c - 1]))
+                w.row_dimensions[r].height = min(240, max(15, 15 * top))
+            for col, wd in zip("ABCDE", widths):
+                w.column_dimensions[col].width = wd
+            w.freeze_panes = "A2"
+            w.sheet_properties.pageSetUpPr.fitToPage = True
+            if rows:
+                w.auto_filter.ref = f"A1:E{len(rows) + 1}"
+
+        dump_hosts("Windows Hosts", by_os["windows"])
+        dump_hosts("Linux Hosts", by_os["linux"])
+        if by_os["other"]:
+            dump_hosts("Other Hosts", by_os["other"])
+    wb.save(out)
+
+
+def write_hosts_critical_excel(data, items, out):
+    """Legacy standalone hosts file (kept for compat). Main report now embeds these sheets."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    wb = Workbook()
+    hdr_font = Font(bold=True, color="FFFFFF")
+    hdr_fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
+    thin = Side(style="thin", color="D9D9D9")
+    bd = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    headers = ["IP Host", "Host Name", "Critical/High Software", "Note", "Recommendation"]
+    widths = [18, 25, 50, 60, 45]
+
+    def fill_sheet(ws, rows):
+        ws.append(headers)
+        for c in range(1, len(headers) + 1):
+            x = ws.cell(row=1, column=c)
+            x.font = hdr_font
+            x.fill = hdr_fill
+            x.alignment = center
+            x.border = bd
+        ws.row_dimensions[1].height = 22
+        rows.sort(key=lambda r: (-r[2].count("\n"), r[1].lower()))
+        for r, row in enumerate(rows, start=2):
+            top = 1
+            for c, v in enumerate(row, start=1):
+                cell = ws.cell(row=r, column=c, value=v)
+                cell.alignment = center if c in (1, 2) else left
+                cell.border = bd
+                s = "" if v is None else str(v)
+                per = max(10, int(widths[c - 1] * 1.0))
+                lines = 0
+                for seg in s.split("\n"):
+                    lines += max(1, -(-len(seg) // per))
+                top = max(top, max(1, lines))
+            ws.row_dimensions[r].height = min(240, max(15, 15 * top))
+        for col, wd in zip("ABCDE", widths):
+            ws.column_dimensions[col].width = wd
+        ws.freeze_panes = "A2"
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        if rows:
+            ws.auto_filter.ref = f"A1:E{len(rows) + 1}"
+
+    by_os = _hosts_critical_by_os(data, items)
+
+    # reuse default sheet for first title to avoid empty "Sheet"
+    sheets = [("Windows Hosts", "windows"), ("Linux Hosts", "linux")]
+    if by_os["other"]:
+        sheets.append(("Other Hosts", "other"))
+    for i, (title, key) in enumerate(sheets):
+        ws = wb.active if i == 0 else wb.create_sheet(title)
+        if ws.title != title:
+            ws.title = title
+        fill_sheet(ws, by_os[key])
     wb.save(out)
 
 
@@ -804,7 +978,7 @@ def main(argv=None):
     if a.output:
         out = Path(a.output)
     else:
-        # الافتراضي: داخل مجلد out
+        # Default: inside out/ folder
         out = get_out_dir() / f"risk_report_{inp.stem}.json"
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Hosts {summary['total_hosts']} SW {summary['unique_software']} "
@@ -814,8 +988,16 @@ def main(argv=None):
     print(f"Saved {out}")
     if a.excel:
         xout = out.with_suffix(".xlsx")
-        write_risk_excel(items, eol_hosts, summary, str(xout))
+        write_risk_excel(items, eol_hosts, summary, str(xout), data)
         print(f"Saved {xout}")
+        # cleanup legacy split file if it exists
+        legacy = out.with_name(out.stem + "_hosts.xlsx")
+        try:
+            if legacy.exists():
+                legacy.unlink()
+                print(f"Removed legacy {legacy.name}")
+        except Exception:
+            pass
     return 0
 
 

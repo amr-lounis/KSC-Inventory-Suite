@@ -130,3 +130,49 @@ def test_process_one_end_to_end(tmp_path, monkeypatch):
     rc = j2e.process_one(str(inp), str(out))
     assert rc == 0
     assert out.exists()
+
+
+def _dup_inventory():
+    return {
+        "hosts": [
+            {"host": {"os": "Windows 10", "ip": "10.0.0.1", "display_name": "PC1"},
+             "software": [{"name": "Google Chrome", "version": "100.0",
+                           "publisher": "Google"}]},
+            {"host": {"os": "Windows 11", "ip": "10.0.0.2", "display_name": "PC2"},
+             "software": [{"name": "google chrome", "version": "152.0",
+                           "publisher": "Google"}]},
+            {"host": {"os": "Windows 10", "ip": "10.0.0.3", "display_name": "PC3"},
+             "software": [{"name": "Safe Tool", "version": "1.0",
+                           "publisher": "X"}]},
+        ]
+    }
+
+
+def test_merge_uniq_by_name_groups_versions():
+    split, _ = j2e.dedup_by_os(_dup_inventory())
+    assert len(split["windows"]) == 3  # dedup stays per-version
+    merged = j2e._merge_uniq_by_name(split["windows"])
+    assert len(merged) == 2
+    chrome = merged["google chrome"]
+    assert chrome["version"] == "100.0, 152.0"
+    assert chrome["count"] == 2
+    assert sorted(chrome["hosts"]) == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_software_sheet_has_no_duplicate_software(tmp_path):
+    split, counts = j2e.dedup_by_os(_dup_inventory())
+    out = tmp_path / "soft.xlsx"
+    j2e.write_excel(split, str(out), counts)
+    from openpyxl import load_workbook
+    wb = load_workbook(out)
+    ws = wb["Windows Software"]
+    names = [ws.cell(row=r, column=1).value
+             for r in range(2, ws.max_row + 1)]
+    assert len(names) == len({n.strip().lower() for n in names}) == 2
+    for r in range(2, ws.max_row + 1):
+        if ws.cell(row=r, column=1).value.lower() == "google chrome":
+            assert ws.cell(row=r, column=2).value == "100.0, 152.0"
+            assert ws.cell(row=r, column=4).value == 2
+    # Summary counts merged names, Hosts sheet keeps per-host detail
+    assert wb["Summary"].cell(row=2, column=3).value == 2
+    assert wb["Hosts - Windows"].max_row == 4  # header + 3 host rows
