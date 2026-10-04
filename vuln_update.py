@@ -258,6 +258,8 @@ DEFAULT_STATIC_RULES = {
     ["adobe reader", "adobe reader"],
     ["acrobat reader", "adobe reader"],
     ["java", "java"],
+    ["openjdk", "java"],
+    ["jre", "java"],
     ["vlc", "vlc media player"],
     ["7-zip", "7-zip"],
     ["winrar", "winrar"],

@@ -67,10 +67,11 @@ def test_risk_excel_has_os_sheets_and_no_old_ones(tmp_path):
     out = tmp_path / "risk.xlsx"
     vc.write_risk_excel(items, [], summary, str(out))
     wb = load_workbook(out)
-    assert wb.sheetnames == ["Summary", "Windows Soft", "Linux Soft",
-                             "Other Soft", "EOL Hosts"]
+    assert wb.sheetnames == ["Summary", "Windows Soft", "Linux Soft"]
     assert "Critical Actions" not in wb.sheetnames
     assert "All Findings" not in wb.sheetnames
+    assert "EOL Hosts" not in wb.sheetnames
+    assert "Other Soft" not in wb.sheetnames
 
 
 def test_os_sheets_show_all_programs_including_safe(tmp_path):

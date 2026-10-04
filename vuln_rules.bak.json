@@ -84,6 +84,14 @@
     [
       "anydesk",
       "anydesk"
+    ],
+    [
+      "openjdk",
+      "java"
+    ],
+    [
+      "jre",
+      "java"
     ]
   ],
   "aliases": {
@@ -4535,12 +4543,12 @@
   "upstream_latest": {
     "google chrome": {
       "major": 154,
-      "checked": "2026-09-27",
+      "checked": "2026-09-29",
       "source": "endoflife.date/chrome"
     },
     "mozilla firefox": {
-      "major": 156,
-      "checked": "2026-09-27",
+      "major": 157,
+      "checked": "2026-09-29",
       "source": "endoflife.date/firefox"
     }
   },
@@ -4571,7 +4579,7 @@
   "sources": {
     "endoflife_date": {
       "url": "https://endoflife.date/api",
-      "fetched_at": "2026-09-27",
+      "fetched_at": "2026-09-29",
       "products": [
         "almalinux",
         "centos",
@@ -4594,8 +4602,8 @@
     },
     "cisa_kev": {
       "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-      "fetched_at": "2026-09-27",
-      "entries": 1726
+      "fetched_at": "2026-09-29",
+      "entries": 1728
     }
   }
 }

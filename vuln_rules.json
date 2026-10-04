@@ -84,6 +84,14 @@
     [
       "anydesk",
       "anydesk"
+    ],
+    [
+      "openjdk",
+      "java"
+    ],
+    [
+      "jre",
+      "java"
     ]
   ],
   "aliases": {
@@ -1249,6 +1257,18 @@
     {
       "match_all": [
         "firefox",
+        "140"
+      ],
+      "kind": "app",
+      "score": 9,
+      "label": "140 (EOL 2026-09-29, endoflife.date)",
+      "eol": "2026-09-29",
+      "product": "firefox",
+      "action": "Upgrade to a supported version"
+    },
+    {
+      "match_all": [
+        "firefox",
         "141"
       ],
       "kind": "app",
@@ -1596,6 +1616,18 @@
     },
     {
       "match_all": [
+        "firefox",
+        "156"
+      ],
+      "kind": "app",
+      "score": 9,
+      "label": "156 (EOL 2026-09-29, endoflife.date)",
+      "eol": "2026-09-29",
+      "product": "firefox",
+      "action": "Upgrade to a supported version"
+    },
+    {
+      "match_all": [
         "chrome",
         "16"
       ],
@@ -1628,6 +1660,18 @@
       "label": "17 (EOL 2012-03-13, endoflife.date)",
       "eol": "2012-03-13",
       "product": "chrome",
+      "action": "Upgrade to a supported version"
+    },
+    {
+      "match_all": [
+        "java",
+        "17"
+      ],
+      "kind": "app",
+      "score": 9,
+      "label": "17 (EOL 2026-09-30, endoflife.date)",
+      "eol": "2026-09-30",
+      "product": "oracle-jdk",
       "action": "Upgrade to a supported version"
     },
     {
@@ -2407,6 +2451,18 @@
       "score": 9,
       "label": "3.0 (EOL 2009-06-27, endoflife.date)",
       "eol": "2009-06-27",
+      "product": "python",
+      "action": "Upgrade to a supported version"
+    },
+    {
+      "match_all": [
+        "python",
+        "3.10"
+      ],
+      "kind": "app",
+      "score": 9,
+      "label": "3.10 (EOL 2026-10-01, endoflife.date)",
+      "eol": "2026-10-01",
       "product": "python",
       "action": "Upgrade to a supported version"
     },
@@ -4535,12 +4591,12 @@
   "upstream_latest": {
     "google chrome": {
       "major": 154,
-      "checked": "2026-09-29",
+      "checked": "2026-10-04",
       "source": "endoflife.date/chrome"
     },
     "mozilla firefox": {
       "major": 157,
-      "checked": "2026-09-29",
+      "checked": "2026-10-04",
       "source": "endoflife.date/firefox"
     }
   },
@@ -4556,12 +4612,12 @@
       "source": "internet (vuln_update)"
     },
     "python": {
-      "min": "3.10.21",
+      "min": "3.11.17",
       "action": "Upgrade Python",
       "source": "internet (vuln_update)"
     },
     "java": {
-      "min": "17.0.20.1",
+      "min": "21.0.12.1",
       "action": "Update Java / remove if unused",
       "source": "internet (vuln_update)"
     }
@@ -4571,7 +4627,7 @@
   "sources": {
     "endoflife_date": {
       "url": "https://endoflife.date/api",
-      "fetched_at": "2026-09-29",
+      "fetched_at": "2026-10-04",
       "products": [
         "almalinux",
         "centos",
@@ -4590,12 +4646,12 @@
         "windows",
         "windows-server"
       ],
-      "entries": 370
+      "entries": 374
     },
     "cisa_kev": {
       "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-      "fetched_at": "2026-09-29",
-      "entries": 1728
+      "fetched_at": "2026-10-04",
+      "entries": 1733
     }
   }
 }

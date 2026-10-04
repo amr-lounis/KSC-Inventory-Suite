@@ -124,7 +124,11 @@ def cmp_versions(a, b):
 
 
 def entry_matches(norm, entry):
-    """Supports {'match': 'substr'} and {'match_all': ['t1','t2',...]} (all tokens)."""
+    """Supports {'match': 'substr'} and {'match_all': ['t1','t2',...]} (all tokens).
+
+    Legacy substring semantics; EOL checks use the stricter
+    _eol_entry_matches() below (word + version-component matching).
+    """
     m = entry.get("match")
     if m and m in norm:
         return True
@@ -132,6 +136,89 @@ def entry_matches(norm, entry):
     if ma and all(t in norm for t in ma):
         return True
     return False
+
+
+_VER_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)*$")
+_VER_IN_TEXT_RE = re.compile(r"\d+(?:\.\d+)*")
+_WORD_RX_CACHE: Dict[str, "re.Pattern"] = {}
+_VER_WORD_RX_CACHE: Dict[str, "re.Pattern"] = {}
+_VER_PARTS_CACHE: Dict[str, Optional[tuple]] = {}
+_PY_LIB_RE = re.compile(r"^python\d*[-_][a-z]")
+
+
+def _word_rx(token):
+    rx = _WORD_RX_CACHE.get(token)
+    if rx is None:
+        rx = re.compile(r"\b" + re.escape(token) + r"(?![a-z])")
+        if len(_WORD_RX_CACHE) < 5000:
+            _WORD_RX_CACHE[token] = rx
+    return rx
+
+
+def _ver_word_rx(token):
+    """Standalone number in text: no digit/letter glued on either side."""
+    rx = _VER_WORD_RX_CACHE.get(token)
+    if rx is None:
+        rx = re.compile(r"(?<![a-z0-9])" + re.escape(token) + r"(?![a-z0-9])")
+        if len(_VER_WORD_RX_CACHE) < 5000:
+            _VER_WORD_RX_CACHE[token] = rx
+    return rx
+
+
+def _ver_token_parts(token):
+    """Numeric dotted token -> int tuple; None for non-version tokens."""
+    if token in _VER_PARTS_CACHE:
+        return _VER_PARTS_CACHE[token]
+    m = _VER_TOKEN_RE.match(str(token or "").strip())
+    v = tuple(int(x) for x in m.group(0).split(".")) if m else None
+    if len(_VER_PARTS_CACHE) < 5000:
+        _VER_PARTS_CACHE[token] = v
+    return v
+
+
+def _eol_entry_matches(norm, version, entry):
+    """Strict EOL matching: name tokens as whole words; version tokens as
+    leading version components OR standalone numbers in the product name
+    (branding years like 'Office 2007' / 'SQL Server 2008').
+
+    Fixes substring over-matching, e.g. token '7' matching version
+    '17.0.20', '15' matching '152.0', or '6.0' matching '13.2.5026.0'.
+    """
+    m = entry.get("match")
+    if m:
+        combined = f"{norm} {str(version or '').strip().lower()}".strip()
+        return m in norm or m in combined
+    ma = entry.get("match_all")
+    if not ma:
+        return False
+    ver = str(version or "").strip().lower()
+    combined = f"{norm} {ver}".strip()
+    ver_cands = []
+    if ver:
+        for grp in _VER_IN_TEXT_RE.findall(ver):
+            try:
+                ver_cands.append(tuple(int(x) for x in grp.split(".")))
+            except ValueError:
+                continue
+    ver_cands = [c for c in ver_cands if c]
+    for t in ma:
+        vp = _ver_token_parts(t)
+        if vp is not None:
+            if any(c[:len(vp)] == vp for c in ver_cands):
+                continue
+            if _ver_word_rx(t).search(norm):
+                continue
+            return False
+        elif not _word_rx(t).search(combined):
+            return False
+    return True
+
+
+def _is_python_lib(norm):
+    """Distro library packages (python3-apt, python3-botocore, ...) are not
+    the Python interpreter: interpreter EOL/min-version rules don't apply."""
+    return "python" in norm and bool(
+        _PY_LIB_RE.search(norm) or norm.startswith("libpython"))
 
 
 @lru_cache(maxsize=8)
@@ -199,11 +286,13 @@ def _check_eol(norm: str, version: str, rules: dict) -> Tuple[int, List[str], Li
     score, reasons, actions = 0, [], []
     ver_norm = strip_accents(str(version or "").lower())
     ver_norm = _WS_RE.sub(" ", ver_norm).strip()
-    combined = f"{norm} {ver_norm}".strip()
+    skip_python = _is_python_lib(norm)
     for item in (rules.get("eol_products") or []) + (rules.get("upstream_eol") or []):
         if item.get("kind", "app") != "app":
             continue
-        if entry_matches(norm, item) or entry_matches(combined, item):
+        if skip_python and item.get("product") == "python":
+            continue
+        if _eol_entry_matches(norm, ver_norm, item):
             score = max(score, int(item.get("score", 9)))
             reasons.append(item.get("label", item.get("match", "?")))
             if item.get("action"):
@@ -222,6 +311,8 @@ def _check_min_version(norm: str, fam: Optional[str], version: str, name: str,
     """Curated minimum-safe-version comparison."""
     score, reasons, actions = 0, [], []
     key = fam or norm
+    if fam == "python" and _is_python_lib(norm):
+        return score, reasons, actions
     entry = (rules.get("min_safe_versions") or {}).get(key)
     if not (entry and version and str(version).strip()):
         return score, reasons, actions
@@ -447,8 +538,379 @@ def cvss_of(cve):
     return 0.0, ""
 
 
+def _cvss_roundup(v):
+    """FIRST CVSS v3.1 Roundup: smallest 1-decimal number >= input."""
+    scaled = v * 100000.0
+    if float(int(scaled)) == scaled:
+        return round(v, 1)
+    import math
+    return (math.floor(scaled / 10000.0) + 1) / 10.0
+
+
+def cvss_v3_base_score(vector):
+    """Numeric base score (0.0-10.0) from a CVSS v3.x vector string.
+
+    Implements FIRST CVSS v3.1 equations. Returns None for missing,
+    malformed, or non-v3 vectors (e.g. CVSS v4, which OSV may also emit).
+    """
+    try:
+        parts = str(vector or "").strip().split("/")
+        if len(parts) < 2 or not parts[0].startswith("CVSS:3."):
+            return None
+        m = {}
+        for p in parts[1:]:
+            if ":" in p:
+                k, v = p.split(":", 1)
+                m[k.strip()] = v.strip()
+        changed = m.get("S") == "C"
+        av = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}[m["AV"]]
+        ac = {"L": 0.77, "H": 0.44}[m["AC"]]
+        if changed:
+            pr = {"N": 0.85, "L": 0.68, "H": 0.5}[m["PR"]]
+        else:
+            pr = {"N": 0.85, "L": 0.62, "H": 0.27}[m["PR"]]
+        ui = {"N": 0.85, "R": 0.62}[m["UI"]]
+        c = {"H": 0.56, "L": 0.22, "N": 0.0}[m["C"]]
+        i = {"H": 0.56, "L": 0.22, "N": 0.0}[m["I"]]
+        a = {"H": 0.56, "L": 0.22, "N": 0.0}[m["A"]]
+    except (KeyError, ValueError, AttributeError):
+        return None
+    iss = 1.0 - (1.0 - c) * (1.0 - i) * (1.0 - a)
+    if not changed:
+        impact = 6.42 * iss
+    elif iss <= 0:
+        return 0.0
+    else:
+        impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.029) ** 15)
+    exploit = 8.22 * av * ac * pr * ui
+    if impact <= 0:
+        return 0.0
+    raw = min(impact + exploit, 10.0) if not changed \
+        else min(1.08 * (impact + exploit), 10.0)
+    return _cvss_roundup(raw)
+
+
+# ---- OSV.dev (Linux distro packages): version-aware, batch, no key needed ----
+OSV_URL = "https://api.osv.dev/v1/querybatch"
+OSV_BATCH = 500
+_OSV_TEXT_SEV = {"critical": 9.0, "high": 7.5, "medium": 5.0,
+                 "low": 2.5, "negligible": 0.5}
+
+
+def _osv_name_variants(name):
+    ln = str(name or "").strip().lower()
+    out = [ln] if ln else []
+    m = re.match(r"^python3?[-_](.+)$", ln)
+    if m and m.group(1) and m.group(1) not in out:
+        out.append(m.group(1))
+    return out[:2]
+
+
+def _osv_ecosystems(version):
+    """Candidate OSV ecosystems from a distro version string.
+
+    Inventory OS data is often just 'Linux', so the distro major is unknown:
+    query supported majors and merge by CVE ID (server filters each one).
+    RHEL-style versions have no reliable mapping -> skipped (heuristic only).
+    """
+    v = str(version or "").lower()
+    if not v:
+        return []
+    if ".el" in v or "rhel" in v or "rocky" in v or "alma" in v or "suse" in v:
+        return []
+    if "ubuntu" in v:
+        return ["Ubuntu:24.04", "Ubuntu:22.04", "Ubuntu:20.04"]
+    return ["Debian:12", "Debian:11", "Ubuntu:22.04", "Ubuntu:24.04"]
+
+
+def _osv_post(batch, timeout=60):
+    data = json.dumps({"queries": batch}).encode("utf-8")
+    req = urllib.request.Request(OSV_URL, data=data,
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "ksc-inventory/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _osv_cvss(vuln):
+    """(score|None, approx_flag) from an OSV vuln entry."""
+    best = None
+    for sev in vuln.get("severity", []) or []:
+        if str(sev.get("type", "")).upper().startswith("CVSS_V3"):
+            s = cvss_v3_base_score(sev.get("score", ""))
+            if s is not None and (best is None or s > best):
+                best = s
+    if best is not None:
+        return best, False
+    txt = str(((vuln.get("database_specific") or {}).get("severity", ""))).strip().lower()
+    if txt in _OSV_TEXT_SEV:
+        return _OSV_TEXT_SEV[txt], True
+    return None, False
+
+
+def _brief_osv_vuln(v):
+    sc, approx = _osv_cvss(v)
+    return {"id": v.get("id", "?"), "cvss": sc, "approx": approx,
+            "published": (v.get("published") or "")[:10],
+            "summary": (v.get("summary") or "")[:120]}
+
+
+def enrich_osv(data, items, online=True, cache_file=None, fetcher=None):
+    """Version-aware OSV.dev enrichment for Linux-seen software.
+
+    Score becomes max(heuristic, best confirmed CVSS). Only raises, never
+    lowers: absence from OSV means 'no known CVE for this build', not safe.
+    Cached in osv_cache.json; failures non-fatal (heuristic scores kept).
+    """
+    cache_file = Path(cache_file) if cache_file else cache_path("osv_cache.json")
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict):
+            cache = {}
+    except Exception:
+        cache = {}
+    fetch = fetcher or _osv_post
+
+    item_keys = {}
+    missing, seen_keys = [], set()
+    for idx, it in enumerate(items or []):
+        if "linux" not in (it.get("os") or []):
+            continue
+        ver = str(it.get("version") or "").strip()
+        if not ver:
+            continue
+        keys = []
+        for variant in _osv_name_variants(it.get("name")):
+            for eco in _osv_ecosystems(ver):
+                key = f"{eco}|{variant}|{ver}"
+                keys.append(key)
+                if key not in cache and key not in seen_keys:
+                    seen_keys.add(key)
+                    missing.append((key, {"package": {"name": variant, "ecosystem": eco},
+                                          "version": ver}))
+        if keys:
+            item_keys[idx] = keys
+
+    if online and missing:
+        print(f"OSV enrichment: {len(missing)} queries for "
+              f"{len(item_keys)} linux items (cache has {len(cache)})")
+        for off in range(0, len(missing), OSV_BATCH):
+            chunk = missing[off:off + OSV_BATCH]
+            try:
+                res = fetch([q for _, q in chunk])
+                results = res.get("results", [])
+            except Exception as e:
+                print(f"  OSV batch failed ({e}) - keeping heuristic scores")
+                break
+            for (key, _), r in zip(chunk, results):
+                vulns = [ _brief_osv_vuln(v) for v in (r.get("vulns") or [])]
+                vulns.sort(key=lambda v: -((v.get("cvss") or 0.0)))
+                cache[key] = {"vulns": vulns[:10]}
+        try:
+            cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception as e:
+            print(f"Cannot save OSV cache: {e}")
+
+    for idx, keys in item_keys.items():
+        it = items[idx]
+        merged = {}
+        for key in keys:
+            for v in (cache.get(key, {}) or {}).get("vulns", []):
+                prev = merged.get(v.get("id"))
+                if prev is None or (v.get("cvss") or 0.0) > (prev.get("cvss") or 0.0):
+                    merged[v["id"]] = v
+        if not merged:
+            continue
+        have = {c.get("id") if isinstance(c, dict) else c for c in (it.get("cves") or [])}
+        for v in sorted(merged.values(), key=lambda v: -((v.get("cvss") or 0.0)))[:5]:
+            if v["id"] not in have:
+                it.setdefault("cves", []).append(
+                    {"id": v["id"], "cvss": v.get("cvss") or 0.0,
+                     "published": v.get("published", "")})
+                have.add(v["id"])
+        scored = [(v["cvss"], v["id"], v.get("approx", False))
+                  for v in merged.values() if v.get("cvss")]
+        if scored:
+            best, bid, approx = max(scored)
+            if best > (it.get("score") or 0):
+                tag = " (~ecosystem severity)" if approx else ""
+                it["score"] = round(float(best), 1)
+                it["level"] = level_of(it["score"])
+                extra = f" +{len(scored) - 1} more" if len(scored) > 1 else ""
+                it["reasons"].append(
+                    f"OSV: {bid} CVSS {best}{tag} "
+                    f"({it.get('name')} {it.get('version')}{extra})")
+    return items
+
+
+# ---- NVD CPE version-range matching (Windows/desktop apps) ----
+NVD_CPE = {
+    "google chrome": ["cpe:2.3:a:google:chrome"],
+    "microsoft edge": ["cpe:2.3:a:microsoft:edge"],
+    "mozilla firefox": ["cpe:2.3:a:mozilla:firefox"],
+    "opera": ["cpe:2.3:a:opera:opera_browser"],
+    "adobe acrobat": ["cpe:2.3:a:adobe:acrobat", "cpe:2.3:a:adobe:acrobat_reader"],
+    "adobe reader": ["cpe:2.3:a:adobe:acrobat_reader", "cpe:2.3:a:adobe:acrobat"],
+    "java": ["cpe:2.3:a:oracle:jdk", "cpe:2.3:a:oracle:jre"],
+    "python": ["cpe:2.3:a:python:python"],
+    "vlc media player": ["cpe:2.3:a:videolan:vlc_media_player"],
+    "7-zip": ["cpe:2.3:a:7-zip:7-zip"],
+    "winrar": ["cpe:2.3:a:rarlab:winrar"],
+    "notepad++": ["cpe:2.3:a:notepad-plus-plus:notepad++"],
+    "teamviewer": ["cpe:2.3:a:teamviewer:teamviewer"],
+    "anydesk": ["cpe:2.3:a:anydesk:anydesk"],
+}
+
+
+def nvd_fetch_cpe(cpe, api_key=None, timeout=60):
+    params = {"cpeName": cpe, "resultsPerPage": 2000}
+    if api_key:
+        params["apiKey"] = api_key
+    url = NVD_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "ksc-inventory/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _brief_nvd_cve(cve):
+    sc, _sev = cvss_of(cve)
+    matches = []
+    for conf in cve.get("configurations") or []:
+        for node in conf.get("nodes") or []:
+            if node.get("negate"):
+                continue
+            for m in node.get("cpeMatch") or []:
+                if m.get("negate") or not m.get("vulnerable", True):
+                    continue
+                matches.append({"criteria": m.get("criteria", ""),
+                                "versionStartIncluding": m.get("versionStartIncluding"),
+                                "versionStartExcluding": m.get("versionStartExcluding"),
+                                "versionEndIncluding": m.get("versionEndIncluding"),
+                                "versionEndExcluding": m.get("versionEndExcluding")})
+    return {"id": cve.get("id", "?"), "cvss": sc,
+            "published": (cve.get("published") or "")[:10], "match": matches}
+
+
+def _nvd_range_hit(criteria, m, installed):
+    """True if installed version is inside the CPE match range, False if
+    outside, None when the entry states no usable version info."""
+    parts = str(criteria or "").split(":")
+    embedded = parts[5] if len(parts) > 5 else "*"
+    si, sx, ei, ex = (m.get("versionStartIncluding"), m.get("versionStartExcluding"),
+                      m.get("versionEndIncluding"), m.get("versionEndExcluding"))
+    if not any([si, sx, ei, ex]):
+        if embedded in ("*", "-", ""):
+            return None
+        try:
+            return cmp_versions(parse_version_cached(installed),
+                                parse_version_cached(embedded)) == 0
+        except Exception:
+            return None
+    try:
+        vp = parse_version_cached(installed)
+        if si and cmp_versions(vp, parse_version_cached(si)) < 0:
+            return False
+        if sx and cmp_versions(vp, parse_version_cached(sx)) <= 0:
+            return False
+        if ei and cmp_versions(vp, parse_version_cached(ei)) > 0:
+            return False
+        if ex and cmp_versions(vp, parse_version_cached(ex)) >= 0:
+            return False
+    except Exception:
+        return None
+    return True
+
+
+def enrich_nvd_cpe(items, api_key=None, cache_file=None, online=True, fetcher=None):
+    """CPE version-range NVD enrichment for mapped families.
+
+    Only CVEs whose stated range contains the installed version raise the
+    score (to the CVE's CVSS). Unranged product mentions are ignored for
+    scoring. Cached per-CPE in nvd_cache.json under 'cpe::<cpe>' keys.
+    """
+    cache_file = Path(cache_file) if cache_file else cache_path("nvd_cache.json")
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict):
+            cache = {}
+    except Exception:
+        try:
+            cache = json.loads((get_app_dir() / "nvd_cache.json").read_text(encoding="utf-8"))
+            if not isinstance(cache, dict):
+                cache = {}
+        except Exception:
+            cache = {}
+    fetch = fetcher or (lambda cpe: nvd_fetch_cpe(cpe, api_key))
+
+    fams = sorted({it.get("family") for it in items or [] if it.get("family") in NVD_CPE})
+    cpe_data = {}
+    if online:
+        for fam in fams:
+            for cpe in NVD_CPE[fam]:
+                key = f"cpe::{cpe}"
+                if key not in cache:
+                    try:
+                        raw = fetch(cpe)
+                        cache[key] = [_brief_nvd_cve(v.get("cve", {}))
+                                      for v in (raw.get("vulnerabilities") or [])]
+                        print(f"  NVD CPE {cpe}: {len(cache[key])} CVE(s)")
+                    except Exception as e:
+                        print(f"  NVD CPE {cpe} failed ({e})")
+                        cache[key] = cache.get(key, [])
+                    time.sleep(1 if api_key else NVD_DELAY)
+                cpe_data[cpe] = cache.get(key, [])
+        try:
+            cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception as e:
+            print(f"Cannot save NVD cache: {e}")
+    else:
+        for fam in fams:
+            for cpe in NVD_CPE[fam]:
+                cpe_data[cpe] = cache.get(f"cpe::{cpe}", [])
+
+    for it in items or []:
+        fam = it.get("family")
+        if fam not in NVD_CPE:
+            continue
+        ver = str(it.get("version") or "").strip()
+        if not ver:
+            continue
+        hits, seen = [], set()
+        for cpe in NVD_CPE[fam]:
+            for cve in cpe_data.get(cpe, []):
+                cid = cve.get("id")
+                if not cid or cid in seen:
+                    continue
+                for m in cve.get("match", []):
+                    if not str(m.get("criteria", "")).startswith(cpe + ":"):
+                        continue
+                    if _nvd_range_hit(m["criteria"], m, ver) is True:
+                        hits.append((cve.get("cvss") or 0.0, cid))
+                        seen.add(cid)
+                        break
+        if not hits:
+            continue
+        have = {c.get("id") if isinstance(c, dict) else c for c in (it.get("cves") or [])}
+        for sc, cid in sorted(hits, reverse=True)[:5]:
+            if cid not in have:
+                it.setdefault("cves", []).append({"id": cid, "cvss": sc})
+                have.add(cid)
+        scored = [(s, i) for s, i in hits if s and s > 0]
+        if scored:
+            best, bid = max(scored)
+            if best > (it.get("score") or 0):
+                it["score"] = round(float(best), 1)
+                it["level"] = level_of(it["score"])
+                extra = f" +{len(scored) - 1} more" if len(scored) > 1 else ""
+                it["reasons"].append(
+                    f"NVD: {bid} CVSS {best} (affects {it.get('name')} {ver}{extra})")
+    return items
+
+
 def enrich_nvd(items, rules, top=30, cache_file=None, api_key=None):
-    """Online NVD keyword enrichment for top-N risky items. Cached, failures non-fatal."""
+    """Online NVD enrichment: CPE version-range matching for mapped families,
+    keyword fallback for the rest. Cached, failures non-fatal."""
+    enrich_nvd_cpe(items, api_key=api_key, cache_file=cache_file)
     cache_file = Path(cache_file) if cache_file else cache_path("nvd_cache.json")
     try:
         cache = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -459,7 +921,8 @@ def enrich_nvd(items, rules, top=30, cache_file=None, api_key=None):
         except Exception:
             cache = {}
     generic = set((rules.get("generic_tokens") or []))
-    cands = [it for it in items if it["score"] >= 4][:top]
+    cands = [it for it in items
+             if it["score"] >= 4 and it.get("family") not in NVD_CPE][:top]
     print(f"NVD enrichment: {len(cands)} items (cache has {len(cache)})")
     for i, it in enumerate(cands, 1):
         q = it.get("family") or it["name"]
@@ -508,7 +971,7 @@ def find_eol_hosts(data, rules):
         info = h.get("host", {}) if isinstance(h.get("host"), dict) else {}
         os_name = str(info.get("os") or "")
         low = normalize_name(os_name)
-        hit = next((e for e in eol_entries if entry_matches(low, e)), None)
+        hit = next((e for e in eol_entries if _eol_entry_matches(low, "", e)), None)
         if hit or not low:
             out.append({"ip": str(info.get("ip") or "").strip() or (info.get("display_name") or "?"),
                         "name": info.get("display_name") or info.get("dn") or "?",
@@ -621,9 +1084,9 @@ def _merge_by_software(items, cat):
             g["pub_set"].add(pub)
             g["publishers"].append(pub)
         try:
-            sc = int(it.get("score", 0))
+            sc = float(it.get("score", 0))
         except (TypeError, ValueError):
-            sc = 0
+            sc = 0.0
         if sc > g["score"]:
             g["score"] = sc
         for h in hosts:
@@ -671,7 +1134,7 @@ def _hosts_critical_by_os(data, items):
                str(it.get("version") or "").strip())
         # keep worst score on collision
         prev = lookup.get(key)
-        if prev is None or int(it.get("score", 0)) > int(prev.get("score", 0)):
+        if prev is None or float(it.get("score", 0)) > float(prev.get("score", 0)):
             lookup[key] = it
 
     by_os = {"windows": [], "linux": [], "other": []}
@@ -694,7 +1157,7 @@ def _hosts_critical_by_os(data, items):
                 risky.append((nm, vr, it))
         if not risky:
             continue
-        risky.sort(key=lambda t: (-int(t[2].get("score", 0)), t[0].lower()))
+        risky.sort(key=lambda t: (-float(t[2].get("score", 0)), t[0].lower()))
         sw_list = "\n".join(f"{n} {v} [{r.get('level')}]" for n, v, r in risky)
         notes = "\n".join(
             f"{n} {v}: {' | '.join(list(r.get('reasons') or []) + [c.get('id') if isinstance(c, dict) else str(c) for c in (r.get('cves') or [])[:3]])}".strip()
@@ -949,7 +1412,7 @@ def main(argv=None):
     ap.add_argument("input", nargs="?", help="kaspersky_inventory_*.json")
     ap.add_argument("-o", "--output", help="risk report JSON path")
     ap.add_argument("--excel", action="store_true", help="also write risk_report_*.xlsx")
-    ap.add_argument("--online", action="store_true", help="fetch KEV + NVD enrichment (needs internet)")
+    ap.add_argument("--online", action="store_true", help="fetch KEV + NVD (CPE) + OSV enrichment (needs internet)")
     ap.add_argument("--top", type=int, default=30, help="NVD-enriched items (default 30)")
     ap.add_argument("--rules", help="path to vuln_rules.json")
     a = ap.parse_args(argv)
@@ -968,6 +1431,7 @@ def main(argv=None):
     items = analyze(data, rules, kev or None)
     if a.online:
         import os
+        enrich_osv(data, items, online=True)
         enrich_nvd(items, rules, top=a.top, api_key=os.environ.get("NVD_API_KEY"))
 
     eol_hosts = find_eol_hosts(data, rules)
