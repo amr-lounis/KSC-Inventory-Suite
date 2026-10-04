@@ -60,7 +60,8 @@ class App(tk.Tk):
         except Exception:
             data = {}
         defaults = {"KSC_SERVER": "127.0.0.1", "KSC_API_PORT": 13299,
-                    "KSC_VERIFY_SSL": False, "KSC_USERNAME": "", "KSC_PASSWORD": ""}
+                    "KSC_VERIFY_SSL": False, "KSC_USERNAME": "", "KSC_PASSWORD": "",
+                    "NVD_API_KEY": ""}
         cur = {**defaults, **data}
         try:
             cur["KSC_API_PORT"] = int(cur["KSC_API_PORT"])
@@ -87,6 +88,10 @@ class App(tk.Tk):
         self.e_pass.grid(row=1, column=3, sticky="ew", pady=3, padx=(6, 0))
         self.var_ssl = tk.BooleanVar(value=bool(cur.get("KSC_VERIFY_SSL", False)))
         ttk.Checkbutton(frm, text="Verify SSL", variable=self.var_ssl).grid(row=2, column=1, sticky="w", pady=3)
+        ttk.Label(frm, text="NVD API key:").grid(row=2, column=2, sticky="w", pady=3, padx=(12, 0))
+        self.e_nvd = ttk.Entry(frm, show="*")
+        self.e_nvd.insert(0, str(cur.get("NVD_API_KEY", "")))
+        self.e_nvd.grid(row=2, column=3, sticky="ew", pady=3, padx=(6, 0))
         for c, w in ((1, 1), (3, 1)):
             frm.columnconfigure(c, weight=w)
 
@@ -115,6 +120,12 @@ class App(tk.Tk):
         self.btn_vuln.grid(row=0, column=4, padx=4, pady=2, sticky="ew")
         for c in range(5):
             afrm.columnconfigure(c, weight=1, uniform="actions")
+        self.var_online = tk.BooleanVar(value=False)
+        ttk.Checkbutton(afrm, text="Online enrichment for Vulnerability Report "
+                                   "(NVD + OSV + EPSS + CISA KEV; slow without NVD API key; "
+                                   "unchecked = use cached data only)",
+                        variable=self.var_online).grid(row=1, column=0, columnspan=5,
+                                                       sticky="w", padx=4, pady=(6, 0))
 
         # ---- log ----
         log_frm = ttk.LabelFrame(body, text="Log", padding=5)
@@ -213,7 +224,8 @@ class App(tk.Tk):
         if not pwd:
             raise ValueError("Password is empty")
         return {"KSC_SERVER": server, "KSC_API_PORT": port, "KSC_VERIFY_SSL": verify,
-                "KSC_USERNAME": user, "KSC_PASSWORD": pwd}
+                "KSC_USERNAME": user, "KSC_PASSWORD": pwd,
+                "NVD_API_KEY": self.e_nvd.get().strip()}
 
     def save_settings(self):
         try:
@@ -310,10 +322,17 @@ class App(tk.Tk):
         src = self.selected_json()
         if not src:
             return
+        # read Tk variables here (main thread), not inside the worker thread
+        args = [src, "--excel"]
+        if self.var_online.get():
+            args.append("--online")
+        nvd_key = self.e_nvd.get().strip()
+        if nvd_key:
+            args += ["--nvd-key", nvd_key]
 
         def target():
             import vuln_check as vc
-            rc = vc.main([src, "--excel"])
+            rc = vc.main(args)
             if rc == 0:
                 self.after(0, lambda: self.status.set("Vulnerability report done"))
                 self.after(0, lambda: messagebox.showinfo("Done", "Risk report (JSON + Excel) saved in out/"))
@@ -321,7 +340,8 @@ class App(tk.Tk):
                 self.after(0, lambda: self.status.set("Vulnerability scan failed"))
             return rc
 
-        self._run_thread(f"-- Vulnerability scan on {Path(src).name} (offline rules + cache) ...",
+        mode = "online: NVD + OSV + EPSS + KEV" if "--online" in args else "offline rules + cache"
+        self._run_thread(f"-- Vulnerability scan on {Path(src).name} ({mode}) ...",
                          "Checking vulnerabilities...", target)
 
     def run_rules(self):
