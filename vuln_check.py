@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Offline-first vulnerability triage for Kaspersky inventory JSON.
 
-Self-contained (stdlib only, no imports from other project scripts).
+Shared helpers (paths, text, versions, OS, canonical names, KEV, HTTP)
+live in lib.py; scoring and reporting stay here.
 Usage:
     py vuln_check.py kaspersky_inventory_*.json [--online] [--top N] [-o out.json] [--excel]
 Rules come from vuln_rules.json (built by vuln_update.py); paths from gui.py/CLI.
@@ -9,9 +10,7 @@ Rules come from vuln_rules.json (built by vuln_update.py); paths from gui.py/CLI
 import json
 import math
 import re
-import sys
 import time
-import unicodedata
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -22,7 +21,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+from lib import (VER_IN_TEXT_RE as _VER_IN_TEXT_RE,
+                 VER_TOKEN_RE as _VER_TOKEN_RE, WS_RE as _WS_RE,
+                 cache_path, canonical_name, classify_os, cmp_versions,
+                 excel_styles, fetch_kev, get_app_dir, get_out_dir, http_json,
+                 load_kev_cache, normalize_name,
+                 # re-exported for callers/tests (used via vc.*):
+                 parse_version, parse_version_cached,
+                 resource_path, split_tokens, split_tokens_list,
+                 strip_accents)
+
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 NVD_DELAY = 7  # seconds between NVD calls without API key
 
@@ -34,32 +42,6 @@ RISK_COLORS = {"Critical": "C00000", "High": "ED7D31", "Medium": "FFC000",
 EVERGREEN_BROWSERS = ("google chrome", "microsoft edge", "mozilla firefox", "opera")
 
 
-def get_app_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
-
-
-def get_out_dir():
-    d = get_app_dir() / "out"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def resource_path(name):
-    p = get_app_dir() / name
-    if p.exists():
-        return p
-    meipas = getattr(sys, "_MEIPASS", None)
-    if meipas and (Path(meipas) / name).exists():
-        return Path(meipas) / name
-    return p
-
-
-def cache_path(name):
-    return get_out_dir() / name
-
-
 def load_rules(path=None):
     p = Path(path) if path else resource_path("vuln_rules.json")
     try:
@@ -67,63 +49,6 @@ def load_rules(path=None):
     except Exception as e:
         print(f"Warning: cannot load rules {p}: {e} - using empty rules")
         return {}
-
-
-_WS_RE = re.compile(r"\s+")
-_TOK_RE = re.compile(r"[^a-z0-9]+")
-_NUM_RE = re.compile(r"\d+")
-
-_VER_CACHE: Dict[str, tuple] = {}
-
-
-def strip_accents(s):
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-
-
-def split_tokens(s, min_len=5, generic=()):
-    return {t for t in _TOK_RE.split(s) if len(t) >= min_len and t not in generic}
-
-
-def split_tokens_list(s, min_len=3, generic=()):
-    """Ordered variant (for top-N slicing)."""
-    return [t for t in _TOK_RE.split(s) if len(t) >= min_len and t not in generic]
-
-
-def normalize_name(name, rules=None):
-    s = strip_accents(str(name or "").lower())
-    s = s.replace("�", "").replace("\x00", " ")
-    s = _WS_RE.sub(" ", s).strip()
-    if rules:
-        for k, v in (rules.get("aliases") or {}).items():
-            if k in s:
-                s = v
-                break
-    return s
-
-
-def parse_version(s):
-    parts = _NUM_RE.findall(str(s or ""))
-    if not parts:
-        return ()
-    return tuple(int(x) for x in parts[:6])
-
-
-def parse_version_cached(s):
-    key = str(s or "")
-    v = _VER_CACHE.get(key)
-    if v is None:
-        v = parse_version(key)
-        if len(_VER_CACHE) < 50000:
-            _VER_CACHE[key] = v
-    return v
-
-
-def cmp_versions(a, b):
-    la, lb = tuple(a or ()), tuple(b or ())
-    n = max(len(la), len(lb))
-    la += (0,) * (n - len(la))
-    lb += (0,) * (n - len(lb))
-    return (la > lb) - (la < lb)
 
 
 def entry_matches(norm, entry):
@@ -141,8 +66,6 @@ def entry_matches(norm, entry):
     return False
 
 
-_VER_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)*$")
-_VER_IN_TEXT_RE = re.compile(r"\d+(?:\.\d+)*")
 _WORD_RX_CACHE: Dict[str, "re.Pattern"] = {}
 _VER_WORD_RX_CACHE: Dict[str, "re.Pattern"] = {}
 _VER_PARTS_CACHE: Dict[str, Optional[tuple]] = {}
@@ -260,23 +183,6 @@ def level_of(score):
         if score >= RISK_MIN_SCORE[level]:
             return level
     return "Safe"
-
-
-def classify_os(os_name):
-    """Windows / Linux / Other from host OS string (self-contained, mirrors json_to_excel)."""
-    s = str(os_name or "").strip().lower()
-    if not s:
-        return "other"
-    if "windows" in s or "microsoft" in s or "win32" in s:
-        return "windows"
-    linux_keywords = (
-        "linux", "ubuntu", "debian", "centos", "rhel", "red hat", "fedora",
-        "suse", "astra", "alt linux", "rosa", "mint", "arch", "gentoo",
-        "oracle linux", "almalinux", "rocky", "kali",
-    )
-    if any(k in s for k in linux_keywords):
-        return "linux"
-    return "other"
 
 
 def _check_eol(norm: str, version: str, rules: dict) -> Tuple[int, List[str], List[str]]:
@@ -460,32 +366,6 @@ def assess(name: str, version: str, publisher: str = "",
             "components": comp}
 
 
-def load_kev_cache():
-    for p in (cache_path("kev_cache.json"), get_app_dir() / "kev_cache.json"):
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-            return d.get("vulnerabilities", d if isinstance(d, list) else [])
-        except Exception:
-            continue
-    return []
-
-
-def fetch_kev(timeout=30):
-    try:
-        req = urllib.request.Request(KEV_URL, headers={"User-Agent": "ksc-inventory/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            d = json.loads(r.read().decode("utf-8"))
-        vulns = d.get("vulnerabilities", [])
-        cache_path("kev_cache.json").write_text(json.dumps(
-            {"fetched_at": datetime.now(timezone.utc).isoformat(), "count": len(vulns),
-             "vulnerabilities": vulns}, ensure_ascii=False), encoding="utf-8")
-        print(f"KEV cache updated: {len(vulns)} entries")
-        return vulns
-    except Exception as e:
-        print(f"KEV download failed ({e}) - using cache")
-        return load_kev_cache()
-
-
 def build_kev_index(kev_list, rules=None):
     """Precompute normalized KEV data once (was re-normalized per software item).
 
@@ -543,7 +423,6 @@ NVD_PAGE_SIZE = 2000
 NVD_DELAY_KEY = 0.8          # 50 requests / 30 s with an API key
 EPSS_BATCH = 50
 OSV_BATCH = 500
-UA_HEADERS = {"User-Agent": "ksc-inventory/2.0"}
 
 TTL_NVD = 3 * 86400
 TTL_OSV = 3 * 86400
@@ -594,39 +473,6 @@ class TTLCache:
             print(f"Cannot save cache {self.path.name}: {e}")
 
 
-def _http_json(url, data=None, headers=None, timeout=60, retries=3):
-    """GET/POST JSON with retry on rate-limit / transient errors."""
-    hdrs = dict(UA_HEADERS)
-    if headers:
-        hdrs.update(headers)
-    body = None
-    if data is not None:
-        body = json.dumps(data).encode("utf-8")
-        hdrs.setdefault("Content-Type", "application/json")
-    last = None
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(url, data=body, headers=hdrs)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            last = e
-            # NVD answers 403 when rate-limited
-            if e.code in (403, 429, 500, 502, 503, 504) and attempt < retries - 1:
-                ra = e.headers.get("Retry-After") if e.headers else None
-                wait = int(ra) if ra and str(ra).isdigit() else 10 * (attempt + 1)
-                time.sleep(min(wait, 60))
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            last = e
-            if attempt < retries - 1:
-                time.sleep(3 * (attempt + 1))
-                continue
-            raise
-    raise last
-
-
 def resolve_nvd_key(cli_value=None):
     """NVD API key: --nvd-key > NVD_API_KEY env > settings.json NVD_API_KEY."""
     import os
@@ -645,12 +491,6 @@ def _nvd_headers(api_key):
     return {"apiKey": api_key} if api_key else {}
 
 
-def nvd_search(query, api_key=None, results=10, timeout=30):
-    params = {"keywordSearch": query, "resultsPerPage": results}
-    return _http_json(NVD_URL + "?" + urllib.parse.urlencode(params),
-                      headers=_nvd_headers(api_key), timeout=timeout)
-
-
 def nvd_fetch_cpe(cpe, api_key=None, timeout=60, max_pages=30):
     """ALL CVEs whose applicability matches the (partial) CPE, paginated.
 
@@ -662,7 +502,7 @@ def nvd_fetch_cpe(cpe, api_key=None, timeout=60, max_pages=30):
     while pages < max_pages:
         params = {"virtualMatchString": cpe, "resultsPerPage": NVD_PAGE_SIZE,
                   "startIndex": start}
-        raw = _http_json(NVD_URL + "?" + urllib.parse.urlencode(params),
+        raw = http_json(NVD_URL + "?" + urllib.parse.urlencode(params),
                          headers=_nvd_headers(api_key), timeout=timeout)
         vulns = raw.get("vulnerabilities") or []
         out.extend(vulns)
@@ -676,7 +516,7 @@ def nvd_fetch_cpe(cpe, api_key=None, timeout=60, max_pages=30):
 
 
 def nvd_fetch_cve(cve_id, api_key=None, timeout=30):
-    raw = _http_json(NVD_URL + "?" + urllib.parse.urlencode({"cveId": cve_id}),
+    raw = http_json(NVD_URL + "?" + urllib.parse.urlencode({"cveId": cve_id}),
                      headers=_nvd_headers(api_key), timeout=timeout)
     v = raw.get("vulnerabilities") or []
     return v[0].get("cve", {}) if v else {}
@@ -1006,11 +846,11 @@ def _osv_ecosystems(version, hints=None):
 
 
 def _osv_post(batch, timeout=60):
-    return _http_json(OSV_URL, data={"queries": batch}, timeout=timeout)
+    return http_json(OSV_URL, data={"queries": batch}, timeout=timeout)
 
 
 def _osv_get(vuln_id, timeout=30):
-    return _http_json(OSV_VULN_URL + urllib.parse.quote(str(vuln_id), safe=""), timeout=timeout)
+    return http_json(OSV_VULN_URL + urllib.parse.quote(str(vuln_id), safe=""), timeout=timeout)
 
 
 def _osv_cvss(vuln):
@@ -1177,7 +1017,7 @@ def fetch_epss(cve_ids, online=True, cache_file=None, fetcher=None):
                 if fetcher:
                     raw = fetcher(chunk)
                 else:
-                    raw = _http_json(EPSS_URL + "?" + urllib.parse.urlencode(
+                    raw = http_json(EPSS_URL + "?" + urllib.parse.urlencode(
                         {"cve": ",".join(chunk)}, safe=","))
                 got = {d["cve"]: {"epss": float(d["epss"]), "pct": float(d.get("percentile") or 0)}
                        for d in raw.get("data", []) if d.get("cve")}
@@ -1468,19 +1308,23 @@ def summarize(items, eol_hosts, total_hosts):
 
 
 def _merge_by_software(items, cat):
-    """Group items of one OS by software name (case-insensitive).
+    """Group items of one OS by canonical software name.
 
-    One row per Software; Version cell holds all distinct versions sorted.
+    Variants like 'Mozilla Firefox (x64 fr)' / 'Mozilla Firefox ESR (x86 fr)'
+    share one row; the Version cell holds all distinct versions sorted.
     Score = worst (max) across versions; hosts/reasons/actions = union.
+    Scoring itself still uses the exact (name, version) pair.
     """
     groups = OrderedDict()
     for it in items:
         cats = it.get("os")
         if cats is not None and cat not in cats:
             continue
-        key = str(it.get("name") or "").strip().lower()
-        if not key:
+        raw = str(it.get("name") or "").strip()
+        if not raw:
             continue
+        cano = canonical_name(raw, it.get("version")) or raw
+        key = cano.lower()
         by_os_hosts = (it.get("hosts_by_os") or {}).get(cat)
         if by_os_hosts is None:  # backward compat: items without OS info
             hosts = list(it.get("hosts") or [])
@@ -1491,7 +1335,7 @@ def _merge_by_software(items, cat):
         g = groups.get(key)
         if g is None:
             g = groups[key] = {
-                "name": str(it.get("name") or "").strip(),
+                "name": cano,
                 "versions": [], "versions_set": set(),
                 "publishers": [], "pub_set": set(),
                 "score": 0, "hosts": [], "hosts_set": set(),
@@ -1598,7 +1442,8 @@ def _hosts_critical_by_os(data, items):
             f"{n} {v}: {' | '.join(list(r.get('reasons') or []) + [c.get('id') if isinstance(c, dict) else str(c) for c in (r.get('cves') or [])[:3]])}".strip()
             for n, v, r in risky)
         recs = "\n".join(f"{n} {v}: {r.get('action') or '-'}" for n, v, r in risky)
-        by_os.get(cat, by_os["other"]).append([ip, hostname, sw_list, notes, recs])
+        os_ver = str(info.get("os") or "").strip() or "-"
+        by_os.get(cat, by_os["other"]).append([ip, hostname, os_ver, sw_list, notes, recs])
     return by_os
 
 
@@ -1632,14 +1477,9 @@ def _method_sheet(wb, hdr_font, hdr_fill, bd, center, left):
 
 def write_risk_excel(items, eol_hosts, summary, out, data=None):
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.styles import PatternFill
     wb = Workbook()
-    hdr_font = Font(bold=True, color="FFFFFF")
-    hdr_fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
-    thin = Side(style="thin", color="D9D9D9")
-    bd = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    hdr_font, hdr_fill, bd, center, left = excel_styles("C00000", "D9D9D9")
     fills = {lv: PatternFill(start_color=RISK_COLORS[lv], end_color=RISK_COLORS[lv], fill_type="solid")
              for lv in RISK_LEVELS}
 
@@ -1769,12 +1609,13 @@ def write_risk_excel(items, eol_hosts, summary, out, data=None):
 
     if data is not None:
         by_os = _hosts_critical_by_os(data, items)
-        h_headers = ["IP Host", "Host Name", "Critical/High Software", "Note", "Recommendation"]
-        h_widths = [18, 25, 50, 60, 45]
+        h_headers = ["IP Host", "Host Name", "OS Version", "Critical/High Software",
+                     "Note", "Recommendation"]
+        h_widths = [18, 25, 30, 50, 60, 45]
 
         def dump_hosts(title, rows):
-            rows = sorted(rows, key=lambda r: (-r[2].count("\n"), r[1].lower()))
-            widths = _autofit_widths(h_headers, rows, h_widths, [22, 30, 55, 80, 50])
+            rows = sorted(rows, key=lambda r: (-r[3].count("\n"), r[1].lower()))
+            widths = _autofit_widths(h_headers, rows, h_widths, [22, 30, 40, 55, 80, 50])
             w = wb.create_sheet(title)
             w.append(h_headers)
             for c in range(1, len(h_headers) + 1):
@@ -1792,76 +1633,18 @@ def write_risk_excel(items, eol_hosts, summary, out, data=None):
                     cell.border = bd
                     top = max(top, _est_lines(v, widths[c - 1]))
                 w.row_dimensions[r].height = min(240, max(15, 15 * top))
-            for col, wd in zip("ABCDE", widths):
+            for col, wd in zip("ABCDEF", widths):
                 w.column_dimensions[col].width = wd
             w.freeze_panes = "A2"
             w.sheet_properties.pageSetUpPr.fitToPage = True
             if rows:
-                w.auto_filter.ref = f"A1:E{len(rows) + 1}"
+                w.auto_filter.ref = f"A1:F{len(rows) + 1}"
 
         dump_hosts("Windows Hosts", by_os["windows"])
         dump_hosts("Linux Hosts", by_os["linux"])
         if by_os["other"]:
             dump_hosts("Other Hosts", by_os["other"])
     _method_sheet(wb, hdr_font, hdr_fill, bd, center, left)
-    wb.save(out)
-
-
-def write_hosts_critical_excel(data, items, out):
-    """Legacy standalone hosts file (kept for compat). Main report now embeds these sheets."""
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    wb = Workbook()
-    hdr_font = Font(bold=True, color="FFFFFF")
-    hdr_fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
-    thin = Side(style="thin", color="D9D9D9")
-    bd = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    headers = ["IP Host", "Host Name", "Critical/High Software", "Note", "Recommendation"]
-    widths = [18, 25, 50, 60, 45]
-
-    def fill_sheet(ws, rows):
-        ws.append(headers)
-        for c in range(1, len(headers) + 1):
-            x = ws.cell(row=1, column=c)
-            x.font = hdr_font
-            x.fill = hdr_fill
-            x.alignment = center
-            x.border = bd
-        ws.row_dimensions[1].height = 22
-        rows.sort(key=lambda r: (-r[2].count("\n"), r[1].lower()))
-        for r, row in enumerate(rows, start=2):
-            top = 1
-            for c, v in enumerate(row, start=1):
-                cell = ws.cell(row=r, column=c, value=v)
-                cell.alignment = center if c in (1, 2) else left
-                cell.border = bd
-                s = "" if v is None else str(v)
-                per = max(10, int(widths[c - 1] * 1.0))
-                lines = 0
-                for seg in s.split("\n"):
-                    lines += max(1, -(-len(seg) // per))
-                top = max(top, max(1, lines))
-            ws.row_dimensions[r].height = min(240, max(15, 15 * top))
-        for col, wd in zip("ABCDE", widths):
-            ws.column_dimensions[col].width = wd
-        ws.freeze_panes = "A2"
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-        if rows:
-            ws.auto_filter.ref = f"A1:E{len(rows) + 1}"
-
-    by_os = _hosts_critical_by_os(data, items)
-
-    # reuse default sheet for first title to avoid empty "Sheet"
-    sheets = [("Windows Hosts", "windows"), ("Linux Hosts", "linux")]
-    if by_os["other"]:
-        sheets.append(("Other Hosts", "other"))
-    for i, (title, key) in enumerate(sheets):
-        ws = wb.active if i == 0 else wb.create_sheet(title)
-        if ws.title != title:
-            ws.title = title
-        fill_sheet(ws, by_os[key])
     wb.save(out)
 
 

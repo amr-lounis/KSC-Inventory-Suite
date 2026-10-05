@@ -7,16 +7,7 @@ import requests, urllib3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ksc")
 
-def get_app_dir():
-    # when frozen (PyInstaller exe), use exe folder, otherwise script folder
-    if getattr(sys, 'frozen', False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
-
-def get_out_dir():
-    d = get_app_dir() / "out"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+from lib import get_app_dir, get_out_dir
 
 # ---------- settings.json handling ----------
 SETTINGS_PATH = get_app_dir() / "settings.json"

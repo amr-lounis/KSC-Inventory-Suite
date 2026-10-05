@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import glob
 import json
-import sys
 import threading
 from pathlib import Path
 import tkinter as tk
@@ -9,16 +8,11 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 import kaspersky_inventory as ksc
 import json_to_excel as j2e
+from lib import get_app_dir
 
 ACCENT = "#2563EB"
 HEADER_BG = "#1F2937"
 BODY_BG = "#F2F4F8"
-
-
-def get_app_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
 
 
 SETTINGS = get_app_dir() / "settings.json"

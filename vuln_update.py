@@ -17,60 +17,19 @@ and keeps user customizations untouched. Stdlib only.
 import json
 import os
 import re
-import sys
-import unicodedata
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-UA = {"User-Agent": "ksc-inventory/1.0"}
-KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+from lib import (USER_AGENT as UA, KEV_URL, clean_label, fetch_kev,
+                 http_json, resource_path)
+
 EOL_API_BASE = "https://endoflife.date/api"
 UPDATE_WORKERS = 8  # parallel endoflife.date downloads (I/O bound)
 
-_PAREN_RE = re.compile(r"\(.*?\)")
-_WS_RE = re.compile(r"\s+")
 _MAJOR_RE = re.compile(r"(\d+)")
-
-
-def get_app_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
-
-
-def get_out_dir():
-    d = get_app_dir() / "out"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def resource_path(name):
-    """Rules live next to exe; fall back to bundled _MEIPASS."""
-    p = get_app_dir() / name
-    if p.exists():
-        return p
-    meipas = getattr(sys, "_MEIPASS", None)
-    if meipas and (Path(meipas) / name).exists():
-        return Path(meipas) / name
-    return p
-
-
-def cache_path(name):
-    """Cache files (KEV/NVD) live in out/."""
-    return get_out_dir() / name
-
-
-def strip_accents(s):
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-
-
-def clean_label(label):
-    s = strip_accents(str(label or "").lower())
-    s = _PAREN_RE.sub(" ", s)
-    return _WS_RE.sub(" ", s).strip()
 
 
 def first_token(release) -> str:
@@ -88,11 +47,6 @@ def is_past_date(eol_str, today) -> bool:
     except (ValueError, TypeError):
         return False
 
-
-def fetch_json(url, timeout=30):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
 
 # endoflife.date product -> (kind, keyword for match_all, use_cycle_token)
 EOL_UPSTREAM_PRODUCTS = {
@@ -157,7 +111,7 @@ def _provider_github(repo: str, timeout=20):
 def _provider_videolan(timeout=25):
     req = urllib.request.Request("https://download.videolan.org/pub/videolan/vlc/last-win64.txt",
                                  headers=UA)
-    # NOTE: don't use fetch_json (plain text, not JSON)
+    # NOTE: don't use http_json here (plain text, not JSON)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         v = _clean_version(r.read().decode("utf-8", "replace").strip())
     if not v:
@@ -302,32 +256,8 @@ DEFAULT_STATIC_RULES = {
 
 
 def fetch_eol_product(product, timeout=30):
-    data = fetch_json(f"{EOL_API_BASE}/{product}.json", timeout=timeout)
+    data = http_json(f"{EOL_API_BASE}/{product}.json", timeout=timeout)
     return data if isinstance(data, list) else []
-
-
-def load_kev_cache():
-    for p in (cache_path("kev_cache.json"), get_app_dir() / "kev_cache.json"):
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-            return d.get("vulnerabilities", d if isinstance(d, list) else [])
-        except Exception:
-            continue
-    return []
-
-
-def fetch_kev(timeout=30):
-    try:
-        d = fetch_json(KEV_URL, timeout=timeout)
-        vulns = d.get("vulnerabilities", [])
-        cache_path("kev_cache.json").write_text(json.dumps(
-            {"fetched_at": datetime.now(timezone.utc).isoformat(), "count": len(vulns),
-             "vulnerabilities": vulns}, ensure_ascii=False), encoding="utf-8")
-        print(f"KEV cache updated: {len(vulns)} entries")
-        return vulns
-    except Exception as e:
-        print(f"KEV download failed ({e}) - using cache")
-        return load_kev_cache()
 
 
 def _download_all(all_products: List[str]) -> Dict[str, tuple]:

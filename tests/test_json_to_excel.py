@@ -111,9 +111,11 @@ def test_write_excel_creates_expected_sheets(tmp_path):
 
     from openpyxl import load_workbook
     wb = load_workbook(out)
-    names = set(wb.sheetnames)
-    assert {"Summary", "Windows Software", "Linux Software", "Other Software",
-            "Hosts - Windows", "Hosts - Linux", "Hosts - Other"} <= names
+    assert set(wb.sheetnames) == {"Summary", "Windows Software", "Linux Software"}
+    assert "Other Software" not in wb.sheetnames
+    assert "Hosts - Windows" not in wb.sheetnames
+    assert "Hosts - Linux" not in wb.sheetnames
+    assert "Hosts - Other" not in wb.sheetnames
 
 
 def test_process_one_end_to_end(tmp_path, monkeypatch):
@@ -173,6 +175,32 @@ def test_software_sheet_has_no_duplicate_software(tmp_path):
         if ws.cell(row=r, column=1).value.lower() == "google chrome":
             assert ws.cell(row=r, column=2).value == "100.0, 152.0"
             assert ws.cell(row=r, column=4).value == 2
-    # Summary counts merged names, Hosts sheet keeps per-host detail
+    # Summary counts merged names; per-host Hosts sheets were removed
     assert wb["Summary"].cell(row=2, column=3).value == 2
-    assert wb["Hosts - Windows"].max_row == 4  # header + 3 host rows
+    assert "Hosts - Windows" not in wb.sheetnames
+
+
+def test_write_excel_hosts_sheets_per_host(tmp_path):
+    data = {"hosts": [
+        {"host": {"os": "Windows 10 Pro", "ip": "10.0.0.1", "display_name": "PC1"},
+         "software": [{"name": "B Tool", "version": "2.0", "publisher": ""},
+                      {"name": "A Tool", "version": "", "publisher": ""}]},
+        {"host": {"os": "Ubuntu 22.04", "ip": "10.0.0.2", "display_name": "SRV"},
+         "software": [{"name": "apt", "version": "2.4", "publisher": ""}]},
+    ]}
+    split, counts = j2e.dedup_by_os(data)
+    out = tmp_path / "hosts.xlsx"
+    j2e.write_excel(split, str(out), counts, data["hosts"])
+    from openpyxl import load_workbook
+    wb = load_workbook(out)
+    assert set(wb.sheetnames) == {"Summary", "Windows Software", "Linux Software",
+                                  "Windows Hosts", "Linux Hosts"}
+    ws = wb["Windows Hosts"]
+    assert [ws.cell(row=1, column=c).value for c in range(1, 5)] == \
+        ["IP", "Host Name", "OS Version", "Software"]
+    assert ws.max_row == 2
+    assert ws.cell(row=2, column=1).value == "10.0.0.1"
+    assert ws.cell(row=2, column=2).value == "PC1"
+    assert ws.cell(row=2, column=3).value == "Windows 10 Pro"
+    assert ws.cell(row=2, column=4).value == "A Tool\nB Tool 2.0"
+    assert wb["Linux Hosts"].max_row == 2
